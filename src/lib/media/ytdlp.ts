@@ -489,6 +489,12 @@ const MEDIACONNECT_TIMEOUT = Number(process.env.YTDL_MEDIACONNECT_TIMEOUT_MS || 
 // Render web services allow very long requests (no 60s lambda cap),
 // so production there raises the budget via env (currently 120s).
 const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || 60_000;
+// One yt-dlp invocation walks these clients INTERNALLY (comma list) and
+// stops at the first client that yields playable formats. On slow shared-CPU
+// hosts (Render free) every spawn costs ~10-20s, so a comma-list attempt is
+// far cheaper than JS-level per-client attempts: one process does the whole
+// walk instead of five.
+const CLIENT_WALK = FALLBACK_CLIENTS.join(",");
 
 function isBlockError(err: string): boolean {
   return (
@@ -575,18 +581,18 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   const assigned = getNextCookie();
   const clients = [...FALLBACK_CLIENTS, null];
 
-  // R1: last-known-good cookie with the default client — instant warm path
+  // R1: last-known-good cookie + internal client walk — warm path
   if (st_lastGood() && inBudget()) {
-    const r = await attempt(st_lastGood(), null);
+    const r = await attempt(st_lastGood(), CLIENT_WALK);
     if (r) return r;
     if (rateLimitedRecently()) throw new Error(lastError);
   }
 
-  // R2: remaining healthy cookies sequentially (default client)
+  // R2: remaining healthy cookies sequentially (internal client walk)
   const others = healthy().filter((c) => c.file !== st_lastGood());
   for (const c of others) {
     if (!inBudget() || rateLimitedRecently()) break;
-    const r = await attempt(c.file, null);
+    const r = await attempt(c.file, CLIENT_WALK);
     if (r) return r;
   }
   if (rateLimitedRecently()) throw new Error(lastError);

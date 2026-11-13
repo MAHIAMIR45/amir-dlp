@@ -90,7 +90,7 @@ interface PinterestInfo {
 type PageId = "home" | "docs" | "admin";
 type ModalKind = "tiktok" | "pinterest" | "audio" | "video";
 
-const API_TIMEOUT = 160000;
+const API_TIMEOUT = 240000;
 
 async function fetchJSON<T>(path: string, timeout = API_TIMEOUT): Promise<T> {
   const ctl = new AbortController();
