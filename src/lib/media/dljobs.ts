@@ -23,7 +23,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cliBaseArgs, resolveFfmpegBin, useCliEngine, ytDlpCliPath } from "./engine";
+import { cliBaseArgs, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
 import { getNextCookie, markCookieGood, resolvePython } from "./ytdlp";
 
 export interface DlJob {
@@ -223,7 +223,10 @@ function runYtDlpDownload(
             "--no-playlist",
             "--ffmpeg-location",
             resolveFfmpegBin(),
-            ...(args.cookiefile ? ["--cookies", args.cookiefile] : []),
+            ...(() => {
+              const ck = writableCookiePath(args.cookiefile);
+              return ck ? ["--cookies", ck] : [];
+            })(),
             "-f",
             format,
             "-o",

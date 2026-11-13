@@ -4,7 +4,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { cliBaseArgs, useCliEngine, ytDlpCliPath } from "./engine";
+import { cliBaseArgs, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
 
 export interface SearchVideo {
   id: string;
@@ -251,7 +251,8 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
   const cookiefile = (args.cookiefile as string | null) || null;
   const client = (args.client as string | null) || null;
   const argv = [ytDlpCliPath(), ...cliBaseArgs(), "--ignore-no-formats-error", "--socket-timeout", "25", "--no-playlist", "-J"];
-  if (cookiefile) argv.push("--cookies", cookiefile);
+  const ck = writableCookiePath(cookiefile);
+  if (ck) argv.push("--cookies", ck);
   if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
   argv.push(url);
   const r = await spawnCli(argv, timeoutMs);

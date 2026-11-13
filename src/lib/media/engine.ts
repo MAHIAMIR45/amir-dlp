@@ -9,7 +9,9 @@
 // BOTH modes are 100% yt-dlp + cookies — no third-party download APIs.
 // Selection: VERCEL=1 → cli · YTDL_ENGINE=cli|python forces a mode ·
 // otherwise (z.ai / local dev) → python.
+import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export function useCliEngine(): boolean {
@@ -65,4 +67,26 @@ export function cliBaseArgs(): string[] {
   // yt-dlp's CLI defaults to the deno JS runtime only; YouTube's nsig
   // challenge needs node (or another runtime) or formats go missing.
   return ["--js-runtimes", "node", "--js-runtimes", "bun"];
+}
+
+/**
+ * yt-dlp writes cookie updates back to the cookiefile after every
+ * extraction. On Vercel the bundle (/var/task) is READ-ONLY, so the
+ * cookie must be copied to a writable temp path first — otherwise the
+ * run crashes with "Read-only file system".
+ */
+export function writableCookiePath(cookiefile: string | null | undefined): string | null {
+  if (!cookiefile) return null;
+  try {
+    if (cookiefile.startsWith(os.tmpdir())) return cookiefile;
+  } catch {
+    /* fall through */
+  }
+  try {
+    const dest = path.join(os.tmpdir(), `ck_${crypto.randomBytes(4).toString("hex")}_${path.basename(cookiefile)}`);
+    fs.copyFileSync(cookiefile, dest);
+    return dest;
+  } catch {
+    return cookiefile;
+  }
 }
