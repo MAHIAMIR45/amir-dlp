@@ -306,8 +306,8 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
     if (/HTTP Error 429|Too Many Requests/i.test(joined)) {
       return { ok: false, error: "YouTube is rate-limiting this server (HTTP 429) — please wait about a minute and try again" };
     }
-    if (/[Ss]ign in to confirm|not a bot/i.test(joined)) {
-      return { ok: false, error: "YouTube is asking to verify this session (bot check) — all cookies are being challenged right now, please try again in a few minutes" };
+    if (/[Ss]ign in to confirm|not a bot/i.test(joined) || /failed to extract any player response/i.test(joined)) {
+      return { ok: false, error: "YouTube is temporarily blocking this server's extraction — please wait a minute and try again (a retry usually succeeds)" };
     }
     return { ok: false, error: "No downloadable formats (YouTube may be blocking this server)" };
   }
@@ -473,7 +473,7 @@ export async function ytSearch(q: string, limit = 12): Promise<{ results: Search
   throw new Error((out.error as string) || "Search failed");
 }
 
-const FALLBACK_CLIENTS = ["tv", "web_safari", "android", "ios", "mweb"];
+const FALLBACK_CLIENTS = ["tv", "web_safari", "android", "ios", "mweb", "web", "tv_embedded"];
 // extract.py has an INTERNAL 22s watchdog (python engine), so every attempt
 // ends itself; the JS-side caps below are the hard limits for the CLI engine.
 // Slow shared-CPU hosts (Render free) need bigger values — override via env:
@@ -502,6 +502,8 @@ function isBlockError(err: string): boolean {
     /cookie/i.test(err) ||
     /nsig|n challenge/i.test(err) ||
     /not a bot|bot check/i.test(err) ||
+    // yt-dlp gave up on EVERY internal player client — IP/cookie challenged
+    /failed to extract any player response/i.test(err) ||
     // soft-block symptom: extraction succeeded but YouTube returned no
     // playable streams for this client/cookie combo
     /no downloadable formats|may be blocking/i.test(err)
@@ -638,6 +640,12 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   const totalSecs = Math.round(((Date.now() - budgetStart) / 1000) * 10) / 10;
   const summary = tried.map((t) => `${t.src}:${t.ok ? "OK" : "FAIL"} ${t.secs}s`).join(", ");
   console.log(`[extract] ALL failed for ${url} after ${totalSecs}s — ${lastError} [${summary}]`);
+  // Friendly user-facing messages for the common YouTube-side blocks.
+  if (/failed to extract any player response/i.test(lastError)) {
+    throw new Error(
+      "YouTube is temporarily blocking this server's extraction — please wait a minute and try again (a retry usually succeeds)"
+    );
+  }
   throw new Error(lastError);
 }
 
