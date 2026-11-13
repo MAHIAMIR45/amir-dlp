@@ -79,6 +79,15 @@ export function resolveFfmpegBin(): string {
 export function cliBaseArgs(): string[] {
   // yt-dlp's CLI defaults to the deno JS runtime only; YouTube's nsig
   // challenge needs node (or another runtime) or formats go missing.
+  // Hosts without bun (Render native) can override via YTDL_JS_RUNTIMES=node.
+  const env = (process.env.YTDL_JS_RUNTIMES || "").trim();
+  if (env) {
+    return env
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .flatMap((rt) => ["--js-runtimes", rt]);
+  }
   return ["--js-runtimes", "node", "--js-runtimes", "bun"];
 }
 
