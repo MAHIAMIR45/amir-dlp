@@ -1,0 +1,34 @@
+# --- Secrets & credentials (public repo safety) ---
+.env
+.env.*
+!.env.example
+python/cookies/
+
+# --- Node / Next.js build ---
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+.eslintcache
+
+# --- Runtime data & local artifacts ---
+db/
+*.db
+*.sqlite3
+upload/
+download/
+scripts/
+skills/
+agent-ctx/
+*.log
+Amir-yt/
+tool-results/
+data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+python-runtime/

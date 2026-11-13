@@ -1,0 +1,5 @@
+# Python dependencies for the yt-dlp download engine (python/extract.py,
+# python/download.py). The z.ai publish pipeline installs these into the
+# deployment artifact (python-runtime/site-packages) via uv at build time.
+# Must stay yt-dlp based — no third-party download APIs.
+yt-dlp[default]
