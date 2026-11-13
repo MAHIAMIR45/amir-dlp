@@ -14,18 +14,18 @@ dist/
 .eslintcache
 
 # --- Runtime data & local artifacts ---
-db/
+/db/
 *.db
 *.sqlite3
-upload/
-download/
-scripts/
-skills/
-tool-results/
-agent-ctx/
+/upload/
+/download/
+/scripts/
+/skills/
+/tool-results/
+/agent-ctx/
 *.log
-Amir-yt/
-data/
+/Amir-yt/
+/data/
 
 # --- Python ---
 __pycache__/
