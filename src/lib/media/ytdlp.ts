@@ -200,6 +200,11 @@ function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; st
       proc = spawn(argv[0], argv.slice(1), {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+        // Own process group so a timeout can kill yt-dlp AND its JS-runtime
+        // children (node/bun). Without this a lingering child holds the stdio
+        // pipes open and delays 'close' by ~10s after every timed-out attempt
+        // (visible on slow shared-CPU hosts like Render free).
+        detached: true,
       });
     } catch (e) {
       resolve({ code: 1, stdout: "", stderr: String((e as Error).message || e), timedOut: false });
@@ -210,7 +215,17 @@ function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; st
     const timer = setTimeout(() => {
       timedOut = true;
       try {
-        proc.kill("SIGKILL");
+        if (proc.pid) process.kill(-proc.pid, "SIGKILL"); // negative pid = whole group
+      } catch {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        proc.stdout!.destroy();
+        proc.stderr!.destroy();
       } catch {
         /* ignore */
       }
@@ -450,7 +465,8 @@ function rateLimitedRecently(): boolean {
 // ── Public API ────────────────────────────────────────────────────────
 
 export async function ytSearch(q: string, limit = 12): Promise<{ results: SearchVideo[] }> {
-  const out = await runPython({ mode: "search", q, limit }, 40_000);
+  const searchTimeout = Number(process.env.YTDL_SEARCH_TIMEOUT_MS || "") || 40_000;
+  const out = await runPython({ mode: "search", q, limit }, searchTimeout);
   if (out.ok) {
     return { results: (out.results as SearchVideo[]) || [] };
   }
@@ -458,14 +474,21 @@ export async function ytSearch(q: string, limit = 12): Promise<{ results: Search
 }
 
 const FALLBACK_CLIENTS = ["tv", "web_safari", "android", "ios", "mweb"];
-// extract.py has an INTERNAL 22s watchdog, so every attempt ends itself.
-// JS-side timeout is 25s (3s grace over the python watchdog).
-const EXTRACT_TIMEOUT = 25_000;
-const MEDIACONNECT_TIMEOUT = 28_000;
+// extract.py has an INTERNAL 22s watchdog (python engine), so every attempt
+// ends itself; the JS-side caps below are the hard limits for the CLI engine.
+// Slow shared-CPU hosts (Render free) need bigger values — override via env:
+//   YTDL_EXTRACT_TIMEOUT_MS  per-attempt cap (default 25s)
+//   YTDL_MEDIACONNECT_TIMEOUT_MS  mediaconnect attempt cap (default 28s)
+//   YTDL_EXTRACT_BUDGET_MS   total walk budget (default 60s)
+//   YTDL_SEARCH_TIMEOUT_MS   ytsearch cap (default 40s)
+const EXTRACT_TIMEOUT = Number(process.env.YTDL_EXTRACT_TIMEOUT_MS || "") || 25_000;
+const MEDIACONNECT_TIMEOUT = Number(process.env.YTDL_MEDIACONNECT_TIMEOUT_MS || "") || 28_000;
 // Total walk budget: worst case = budget + one overrunning attempt.
-// MUST stay well under the ~180s gateway (ALB) timeout — a request that
+// On Vercel this MUST stay under the function limit — a request that
 // outlives it returns an opaque HTML 502 and the phone spins forever.
-const EXTRACT_BUDGET = 60_000;
+// Render web services allow very long requests (no 60s lambda cap),
+// so production there raises the budget via env (currently 120s).
+const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || 60_000;
 
 function isBlockError(err: string): boolean {
   return (

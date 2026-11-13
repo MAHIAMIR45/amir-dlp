@@ -422,6 +422,10 @@ function spawnCliDownload(
       proc = spawn(argv[0], argv.slice(1), {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+        // Own process group: on timeout kill yt-dlp AND its JS-runtime children
+        // (node/bun) — a lingering child otherwise holds the stdio pipes open
+        // and delays 'close' after every timed-out attempt.
+        detached: true,
       });
     } catch (e) {
       resolve({ code: 1, stderr: String((e as Error).message || e), timedOut: false });
@@ -452,7 +456,17 @@ function spawnCliDownload(
     const timer = setTimeout(() => {
       timedOut = true;
       try {
-        proc.kill("SIGKILL");
+        if (proc.pid) process.kill(-proc.pid, "SIGKILL"); // negative pid = whole group
+      } catch {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        proc.stdout!.destroy();
+        proc.stderr!.destroy();
       } catch {
         /* ignore */
       }
