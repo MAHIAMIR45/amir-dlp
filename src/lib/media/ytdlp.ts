@@ -1,8 +1,10 @@
-// yt-dlp bridge — spawns the Python extract.py script.
-// Ports the cookie-pool + player-client fallback strategy from app.py.
+// yt-dlp bridge — spawns the Python extract.py script (z.ai) OR the
+// standalone yt-dlp binary (Vercel). Ports the cookie-pool + player-client
+// fallback strategy from app.py.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { cliBaseArgs, useCliEngine, ytDlpCliPath } from "./engine";
 
 export interface SearchVideo {
   id: string;
@@ -84,6 +86,7 @@ function scriptPath(): string {
 }
 
 function runPython(args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  if (useCliEngine()) return runCliEngine(args, timeoutMs);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (v: Record<string, unknown>) => {
@@ -130,6 +133,219 @@ function runPython(args: Record<string, unknown>, timeoutMs: number): Promise<Re
       finish({ ok: false, error: `spawn error: ${(e as Error).message}` });
     }
   });
+}
+
+// ── CLI engine (Vercel: standalone yt-dlp binary — no python runtime) ─
+
+function formatDurCli(sec: unknown): string {
+  const n = typeof sec === "number" ? Math.floor(sec) : 0;
+  if (!n || n <= 0) return "N/A";
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = n % 60;
+  const pad = (v: number) => String(v).padStart(2, "0");
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+function humanSizeCli(size: unknown): string | null {
+  const n = typeof size === "number" ? size : 0;
+  if (!n || n <= 0) return null;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function buildFormatEntryCli(fmt: any): FormatEntry {
+  const vcodec = fmt.vcodec || "none";
+  const acodec = fmt.acodec || "none";
+  const hasVideo = !!vcodec && vcodec !== "none";
+  const hasAudio = !!acodec && acodec !== "none";
+  const width = typeof fmt.width === "number" ? fmt.width : null;
+  const height = typeof fmt.height === "number" ? fmt.height : null;
+  // Portrait videos (Shorts): YouTube names quality by the SHORT side.
+  const portrait = !!(width && height && width !== height);
+  const effHeight = portrait ? Math.min(width as number, height as number) : height;
+  const size = fmt.filesize || fmt.filesize_approx || null;
+  return {
+    format_id: fmt.format_id ?? null,
+    ext: fmt.ext ?? null,
+    resolution: fmt.resolution || (width && height ? `${width}x${height}` : "audio only"),
+    height: effHeight,
+    width,
+    fps: fmt.fps ?? null,
+    vcodec,
+    acodec,
+    abr: fmt.abr || 0,
+    vbr: fmt.vbr ?? null,
+    tbr: fmt.tbr ?? null,
+    filesize: size,
+    filesize_human: humanSizeCli(size),
+    format_note: (fmt.format_note || "") + (portrait ? " · portrait" : ""),
+    has_video: hasVideo,
+    has_audio: hasAudio,
+    url: fmt.url ?? null,
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(argv[0], argv.slice(1), {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+      });
+    } catch (e) {
+      resolve({ code: 1, stdout: "", stderr: String((e as Error).message || e), timedOut: false });
+      return;
+    }
+    proc.stdout!.on("data", (d) => (stdout += d.toString()));
+    proc.stderr!.on("data", (d) => (stderr += d.toString()));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }, timeoutMs);
+    proc.on("error", (e) => {
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        resolve({ code: 1, stdout, stderr: stderr || e.message, timedOut });
+      }
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        resolve({ code: code ?? 1, stdout, stderr, timedOut });
+      }
+    });
+  });
+}
+
+function cliErrorFrom(stderr: string, fallback: string): string {
+  const lines = stderr.split("\n").filter((l) => l.startsWith("ERROR:"));
+  if (lines.length) return lines[lines.length - 1].replace(/^ERROR:\s*/, "").slice(0, 400);
+  const tail = stderr.trim().slice(-300);
+  return tail || fallback;
+}
+
+function runCliEngine(args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  if (args.mode === "search") {
+    return runCliSearch(String(args.q || ""), Number(args.limit || 12), timeoutMs);
+  }
+  return runCliInfo(args, timeoutMs);
+}
+
+async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  const url = String(args.url || "");
+  const cookiefile = (args.cookiefile as string | null) || null;
+  const client = (args.client as string | null) || null;
+  const argv = [ytDlpCliPath(), ...cliBaseArgs(), "--ignore-no-formats-error", "--socket-timeout", "25", "--no-playlist", "-J"];
+  if (cookiefile) argv.push("--cookies", cookiefile);
+  if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
+  argv.push(url);
+  const r = await spawnCli(argv, timeoutMs);
+  if (r.timedOut) {
+    return { ok: false, error: `extraction timed out after ${Math.round(timeoutMs / 1000)}s on this server` };
+  }
+  if (r.code !== 0) {
+    return { ok: false, error: cliErrorFrom(r.stderr, "extraction failed") };
+  }
+  let info: Record<string, any>;
+  try {
+    info = JSON.parse(r.stdout);
+  } catch {
+    return { ok: false, error: "bad yt-dlp JSON output" };
+  }
+  const combined: FormatEntry[] = [];
+  const video_only: FormatEntry[] = [];
+  const audio_only: FormatEntry[] = [];
+  const seen = new Set<string>();
+  for (const fmt of (info.formats || []) as any[]) {
+    if (!fmt || !fmt.url) continue;
+    const fid = String(fmt.format_id ?? "");
+    if (fid && seen.has(fid)) continue;
+    if (fid) seen.add(fid);
+    const entry = buildFormatEntryCli(fmt);
+    if (entry.has_video && entry.has_audio) combined.push(entry);
+    else if (entry.has_video) video_only.push(entry);
+    else if (entry.has_audio) audio_only.push(entry);
+  }
+  const byHeight = (a: FormatEntry, b: FormatEntry) => (b.height || 0) - (a.height || 0);
+  combined.sort(byHeight);
+  video_only.sort(byHeight);
+  audio_only.sort((a, b) => (b.abr || 0) - (a.abr || 0));
+  if (!(combined.length || video_only.length || audio_only.length)) {
+    const joined = r.stderr;
+    if (/HTTP Error 429|Too Many Requests/i.test(joined)) {
+      return { ok: false, error: "YouTube is rate-limiting this server (HTTP 429) — please wait about a minute and try again" };
+    }
+    if (/[Ss]ign in to confirm|not a bot/i.test(joined)) {
+      return { ok: false, error: "YouTube is asking to verify this session (bot check) — all cookies are being challenged right now, please try again in a few minutes" };
+    }
+    return { ok: false, error: "No downloadable formats (YouTube may be blocking this server)" };
+  }
+  return {
+    ok: true,
+    title: info.title ?? null,
+    thumbnail: info.thumbnail ?? null,
+    duration: formatDurCli(info.duration),
+    duration_sec: typeof info.duration === "number" ? info.duration : null,
+    channel: info.uploader || info.channel || "",
+    description: String(info.description || "").slice(0, 300),
+    combined,
+    video_only,
+    audio_only,
+  };
+}
+
+async function runCliSearch(q: string, limit: number, timeoutMs: number): Promise<Record<string, unknown>> {
+  const argv = [
+    ytDlpCliPath(),
+    ...cliBaseArgs(),
+    "--flat-playlist",
+    "--socket-timeout",
+    "20",
+    "--no-playlist",
+    "-J",
+    `ytsearch${limit}:${q}`,
+  ];
+  const r = await spawnCli(argv, timeoutMs);
+  if (r.timedOut) return { ok: false, error: "Search timed out" };
+  if (r.code !== 0) return { ok: false, error: cliErrorFrom(r.stderr, "Search failed") };
+  let data: Record<string, any>;
+  try {
+    data = JSON.parse(r.stdout);
+  } catch {
+    return { ok: false, error: "bad yt-dlp JSON output" };
+  }
+  const videos: SearchVideo[] = [];
+  for (const entry of (data.entries || []) as any[]) {
+    if (!entry) continue;
+    const vidId = String(entry.id || "");
+    const thumbs = entry.thumbnails || [];
+    const thumb = thumbs.length ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${vidId}/hqdefault.jpg`;
+    videos.push({
+      id: vidId,
+      title: entry.title || "",
+      thumbnail: thumb,
+      duration: formatDurCli(entry.duration),
+      channel: entry.channel || entry.uploader || "",
+      views: typeof entry.view_count === "number" ? entry.view_count : null,
+      url: entry.url || entry.webpage_url || `https://www.youtube.com/watch?v=${vidId}`,
+    });
+  }
+  return { ok: true, results: videos };
 }
 
 // ── Cookie pool (smart rotation + cooldown), port of CookiePool ───────

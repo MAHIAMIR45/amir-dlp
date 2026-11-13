@@ -169,8 +169,10 @@ export async function proxyMedia(
 
 // ── ffmpeg helpers ────────────────────────────────────────────────────
 
+import { resolveFfmpegBin } from "./engine";
+
 function ffmpegBin(): string {
-  return "ffmpeg";
+  return resolveFfmpegBin();
 }
 
 function ffmpegHeaders(): string {

@@ -2,7 +2,7 @@
 .env
 .env.*
 !.env.example
-# python/cookies/ ko repo mein include kiya gaya hai (Vercel deployment ke liye, repo PRIVATE hai)
+# python/cookies/ IS included in this PRIVATE repo (needed for Vercel deployment)
 
 # --- Node / Next.js build ---
 node_modules/
@@ -21,10 +21,10 @@ upload/
 download/
 scripts/
 skills/
+tool-results/
 agent-ctx/
 *.log
 Amir-yt/
-tool-results/
 data/
 
 # --- Python ---

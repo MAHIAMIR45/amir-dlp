@@ -23,6 +23,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { cliBaseArgs, resolveFfmpegBin, useCliEngine, ytDlpCliPath } from "./engine";
 import { getNextCookie, markCookieGood, resolvePython } from "./ytdlp";
 
 export interface DlJob {
@@ -199,15 +200,42 @@ function runYtDlpDownload(
     concurrency: 4,
   };
 
+  const useCli = useCliEngine();
   return new Promise((resolve) => {
     const outBase = args.out_base;
     const script = path.join(process.cwd(), "python", "download.py");
-    const proc = spawn(resolvePython(), [script, JSON.stringify(args)], {
-      stdio: ["ignore", "pipe", "pipe"],
+    const spawnOpts = {
+      stdio: ["ignore", "pipe", "pipe"] as const,
       env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
-    });
+    };
+    const proc = useCli
+      ? spawn(
+          ytDlpCliPath(),
+          [
+            ...cliBaseArgs(),
+            "--newline",
+            "--concurrent-fragments",
+            "4",
+            "--socket-timeout",
+            "25",
+            "--retries",
+            "3",
+            "--no-playlist",
+            "--ffmpeg-location",
+            resolveFfmpegBin(),
+            ...(args.cookiefile ? ["--cookies", args.cookiefile] : []),
+            "-f",
+            format,
+            "-o",
+            `${outBase}.%(ext)s`,
+            opts.url,
+          ],
+          spawnOpts
+        )
+      : spawn(resolvePython(), [script, JSON.stringify(args)], spawnOpts);
     job.proc = proc;
     let buf = "";
+    let stderrTail = "";
     let result: YtDlpResult | null = null;
     let settled = false;
     const finish = (r: YtDlpResult) => {
@@ -218,12 +246,24 @@ function runYtDlpDownload(
     };
 
     const span = pctTo - pctFrom;
+    const UNIT: Record<string, number> = { KiB: 1024, MiB: 1048576, GiB: 1073741824 };
     proc.stdout!.on("data", (d) => {
       buf += d.toString();
       const lines = buf.split("\n");
       buf = lines.pop() || "";
       for (const line of lines) {
         const t = line.trim();
+        if (useCli) {
+          // "[download]  34.5% of   10.00MiB at  1.20MiB/s ETA 00:05"
+          const m = t.match(/^\[download\]\s+([\d.]+)% of\s+~?([\d.]+)(KiB|MiB|GiB)(?:\s+at\s+([\d.]+)(KiB|MiB|GiB)\/s)?/);
+          if (m) {
+            const pct = parseFloat(m[1]);
+            const total = parseFloat(m[2]) * UNIT[m[3]];
+            const speed = m[4] ? parseFloat(m[4]) * UNIT[m[5]] : undefined;
+            setPhase(job, pctFrom + (pct / 100) * span, Math.round((total * pct) / 100), speed, total);
+          }
+          continue;
+        }
         if (!t.startsWith("{")) continue;
         try {
           const msg = JSON.parse(t);
@@ -240,7 +280,11 @@ function runYtDlpDownload(
         }
       }
     });
-    proc.stderr!.on("data", () => {}); // yt-dlp is quiet; keep pipe drained
+    proc.stderr!.on("data", (d) => {
+      // keep a small tail for error reporting (CLI engine)
+      stderrTail += d.toString();
+      if (stderrTail.length > 800) stderrTail = stderrTail.slice(-800);
+    });
 
     const timer = setTimeout(() => {
       try {
@@ -253,13 +297,45 @@ function runYtDlpDownload(
 
     proc.on("error", (e) => {
       clearTimeout(timer);
-      finish({ ok: false, error: `python spawn failed: ${e.message}` });
+      finish({ ok: false, error: `${useCli ? "yt-dlp" : "python"} spawn failed: ${e.message}` });
     });
-    proc.on("close", () => {
+    proc.on("close", (code) => {
       clearTimeout(timer);
       if (result) {
         finish(result);
         return;
+      }
+      if (useCli) {
+        // CLI mode: locate the final merged file next to out_base
+        try {
+          const dir = path.dirname(outBase);
+          const base = path.basename(outBase);
+          const files = fs
+            .readdirSync(dir)
+            .filter((f) => f.startsWith(base) && !f.endsWith(".part") && !f.endsWith(".ytdl"))
+            .map((f) => path.join(dir, f));
+          let best: string | null = null;
+          let bestSize = 0;
+          for (const f of files) {
+            const st = fs.statSync(f);
+            if (st.isFile() && st.size > bestSize) {
+              bestSize = st.size;
+              best = f;
+            }
+          }
+          if (best && bestSize > 0) {
+            finish({ ok: true, path: best, size: bestSize, ext: best.slice(best.lastIndexOf(".") + 1) });
+            return;
+          }
+          finish({
+            ok: false,
+            error: `yt-dlp download failed (exit ${code}): ${stderrTail.slice(-300).trim() || "no output file"}`,
+          });
+          return;
+        } catch (e) {
+          finish({ ok: false, error: `yt-dlp output lookup failed: ${(e as Error).message}` });
+          return;
+        }
       }
       finish({ ok: false, error: "yt-dlp download failed (no result)" });
     });
@@ -277,7 +353,7 @@ function faststartRemux(inputPath: string): Promise<{ ok: boolean; filePath?: st
   const out = tmpOut(".mp4");
   return new Promise((resolve) => {
     const proc = spawn(
-      "ffmpeg",
+      resolveFfmpegBin(),
       ["-y", "-loglevel", "error", "-i", inputPath, "-c", "copy", "-movflags", "+faststart", "-f", "mp4", out],
       { stdio: ["ignore", "ignore", "pipe"] }
     );
@@ -410,7 +486,7 @@ function reencodeLocal(
     out,
   ];
   return new Promise((resolve) => {
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(resolveFfmpegBin(), args, { stdio: ["ignore", "pipe", "pipe"] });
     job.proc = proc;
     let buf = "";
     let stderr = "";
@@ -502,7 +578,7 @@ function audioToMp3Local(
     out,
   ];
   return new Promise((resolve) => {
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(resolveFfmpegBin(), args, { stdio: ["ignore", "pipe", "pipe"] });
     job.proc = proc;
     let buf = "";
     let settled = false;
@@ -654,8 +730,11 @@ async function runJob(job: JobInternal, opts: StartDlJobOpts): Promise<void> {
     // avc1+aac source is remuxed losslessly (fast); anything else
     // (vp9/av01/opus — 4K/2K rows etc.) is re-encoded to WhatsApp-safe
     // H.264/AAC. If probing fails, err on the safe side and re-encode.
+    // Codec probe needs ffprobe (absent on Vercel) — when unavailable,
+    // fall back to the codec info of the requested formats (canCopy).
     const codecs = await probeCodecs(downloadedPath);
-    if (codecs && codecs.video === "h264" && codecs.audio === "aac") {
+    const copySafe = codecs ? codecs.video === "h264" && codecs.audio === "aac" : !!opts.canCopy;
+    if (copySafe) {
       job.note = "Finalising WhatsApp-ready MP4…";
       setPhase(job, 92);
       const r = await faststartRemux(downloadedPath);
