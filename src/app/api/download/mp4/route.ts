@@ -5,7 +5,7 @@
 // Engine: yt-dlp + cookies in both modes.
 import { NextRequest } from "next/server";
 import { runDownloadSync, startDlJob } from "@/lib/media/dljobs";
-import { progressPageHtml, jsonError, serveTempFile } from "@/lib/media/streaming";
+import { progressPageHtml, jsonError, htmlErrorPage, serveTempFile } from "@/lib/media/streaming";
 import { useCliEngine } from "@/lib/media/engine";
 import { trackRequest } from "@/lib/tracker";
 
@@ -22,9 +22,15 @@ export async function GET(req: NextRequest) {
   const title = sp.get("title") || "video";
   const dur = sp.get("dur") ? Number(sp.get("dur")) : null;
 
+  // The browser navigates directly to this URL — show a friendly HTML page
+  // on failures instead of raw JSON. API clients (curl/wget, no Accept:
+  // text/html) keep getting JSON.
+  const wantsHtml = (req.headers.get("accept") || "").includes("text/html");
+  const fail = (msg: string, status = 502) => (wantsHtml ? htmlErrorPage(msg, status) : jsonError(msg, status));
+
   if (!url || !/youtu\.be|youtube\.com/i.test(url)) {
     trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 400 });
-    return jsonError("A valid YouTube url is required");
+    return fail("A valid YouTube url is required", 400);
   }
 
   // Copy-safe when the selected video format is avc1 and audio mp4a — the
@@ -52,7 +58,7 @@ export async function GET(req: NextRequest) {
       const r = await runDownloadSync(jobOpts);
       if (!r.ok || !r.filePath || !r.size) {
         trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 502 });
-        return jsonError(r.error || "Download failed — please try again.");
+        return fail(r.error || "Download failed — please try again.");
       }
       trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 200 });
       return serveTempFile(r.filePath, r.size, r.contentType || "video/mp4", safeName);
@@ -64,6 +70,6 @@ export async function GET(req: NextRequest) {
     return progressPageHtml(job.id, safeName, "mp4");
   } catch (e) {
     trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 500 });
-    return jsonError(`Download failed: ${(e as Error).message}`);
+    return fail(`Download failed: ${(e as Error).message}`, 500);
   }
 }

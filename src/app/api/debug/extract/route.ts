@@ -15,6 +15,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { resolvePython, readExtractDebug } from "@/lib/media/ytdlp";
+import { cliBaseArgs, useCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -99,6 +100,7 @@ export async function GET(req: NextRequest) {
   const client = !clientParam || clientParam === "none" ? null : clientParam;
 
   const envInfo = {
+    engine: useCliEngine() ? "cli" : "python",
     python: resolvePython(),
     cwd: process.cwd(),
     cookies: cookies.map((c) => {
@@ -121,10 +123,88 @@ export async function GET(req: NextRequest) {
     node_version: process.version,
   };
 
-  const attempt = await runOne({ mode: "info", url, cookiefile: cookiePath, client }, 40_000);
+  // Vercel has no python3 — run the standalone yt-dlp binary instead of
+  // extract.py and return a COMPACT summary (the -J payload is huge).
+  const attempt = useCliEngine()
+    ? await runCliOne(url, cookiePath, client, 40_000)
+    : await runOne({ mode: "info", url, cookiefile: cookiePath, client }, 40_000);
 
   return new Response(
     JSON.stringify({ env: envInfo, url, cookie: cookiePath ? which : null, client, attempt }, null, 2),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
+}
+
+async function runCliOne(
+  url: string,
+  cookiePath: string | null,
+  client: string | null,
+  timeoutMs: number
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v: Record<string, unknown>) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    try {
+      const argv = [
+        ytDlpCliPath(),
+        ...cliBaseArgs(),
+        "--ignore-no-formats-error",
+        "--socket-timeout",
+        "25",
+        "--no-playlist",
+        "-J",
+      ];
+      const ck = writableCookiePath(cookiePath);
+      if (ck) argv.push("--cookies", ck);
+      if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
+      argv.push(url);
+      const proc = spawn(argv[0], argv.slice(1), {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+      });
+      let out = "";
+      let err = "";
+      proc.stdout.on("data", (d) => (out += d.toString()));
+      proc.stderr.on("data", (d) => (err += d.toString()));
+      const timer = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+        finish({ ok: false, error: `killed after ${timeoutMs}ms` });
+      }, timeoutMs);
+      proc.on("error", (e) => {
+        clearTimeout(timer);
+        finish({ ok: false, error: `spawn failed: ${e.message}` });
+      });
+      proc.on("close", (code) => {
+        clearTimeout(timer);
+        const i = out.indexOf("{");
+        if (code !== 0 && i < 0) {
+          const errLine = err.split("\n").filter((l) => l.startsWith("ERROR:")).pop();
+          return finish({ ok: false, error: (errLine || err || `exit ${code}`).slice(0, 300) });
+        }
+        try {
+          const info = JSON.parse(out.slice(i));
+          finish({
+            ok: true,
+            title: info.title ?? null,
+            extractor: info.extractor_key ?? null,
+            formats: (info.formats || []).length,
+            duration: info.duration ?? null,
+          });
+        } catch {
+          finish({ ok: false, error: "bad JSON output", raw: out.slice(0, 200) });
+        }
+      });
+    } catch (e) {
+      finish({ ok: false, error: (e as Error).message });
+    }
+  });
 }

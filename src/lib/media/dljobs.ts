@@ -24,7 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cliBaseArgs, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
-import { getNextCookie, markCookieGood, resolvePython } from "./ytdlp";
+import { getNextCookie, markCookieBlocked, markCookieGood, resolvePython } from "./ytdlp";
 
 export interface DlJob {
   id: string;
@@ -200,6 +200,14 @@ function runYtDlpDownload(
     concurrency: 4,
   };
 
+  // CLI engine (Vercel): the download phase gets the SAME resilience as
+  // the info phase — a client/cookie walk with per-attempt spawns. On
+  // serverless IPs the default client gets bot-checked intermittently
+  // while tv/web_safari etc. pass, so a single default-client spawn made
+  // downloads fail at random. (The single-spawn path below stays for the
+  // python engine on z.ai.)
+  if (useCliEngine()) return runYtDlpDownloadCli(job, opts, format, pctFrom, pctTo, args.cookiefile);
+
   const useCli = useCliEngine();
   return new Promise((resolve) => {
     const outBase = args.out_base;
@@ -343,6 +351,193 @@ function runYtDlpDownload(
       finish({ ok: false, error: "yt-dlp download failed (no result)" });
     });
   });
+}
+
+// ── CLI download walk (Vercel) ────────────────────────────────────────
+// Each attempt is a full yt-dlp spawn. yt-dlp's youtube extractor accepts
+// a comma-separated player_client list and merges/skips per client, so a
+// bot-check on one client no longer kills the run. Cookie rotation and
+// no-cookie fallbacks mirror the info-phase strategy (ytInfoWithFallback).
+
+const DL_CLIENT_WALK = "tv,web_safari,android,ios,mweb,web";
+
+function cliErrSummary(stderr: string): string {
+  const lines = stderr.split("\n").filter((l) => l.startsWith("ERROR:"));
+  if (lines.length) return lines[lines.length - 1].replace(/^ERROR:\s*/, "").slice(0, 300);
+  return stderr.trim().slice(-300);
+}
+
+/** Human-friendly wording for the download error page (bot-check etc.). */
+function friendlyDlError(err: string): string {
+  if (/sign in to confirm|not a bot/i.test(err)) {
+    return "YouTube is challenging this server's connection (bot check). Please go back and try again — it usually passes on a retry.";
+  }
+  if (/429|too many requests/i.test(err)) {
+    return "YouTube is rate-limiting this server (HTTP 429). Please wait about a minute and try again.";
+  }
+  if (/requested format/i.test(err)) {
+    return "The selected quality is no longer available. Please go back, refresh the formats and try again.";
+  }
+  return err;
+}
+
+/** Locate the finished file for one attempt (largest non-partial output). */
+function pickFinalFile(base: string): YtDlpResult | null {
+  try {
+    const dir = path.dirname(base);
+    const prefix = path.basename(base);
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith(prefix) && !f.endsWith(".part") && !f.endsWith(".ytdl"));
+    let best: string | null = null;
+    let bestSize = 0;
+    for (const f of files) {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.isFile() && st.size > bestSize) {
+        bestSize = st.size;
+        best = path.join(dir, f);
+      }
+    }
+    if (best && bestSize > 0) {
+      return { ok: true, path: best, size: bestSize, ext: best.slice(best.lastIndexOf(".") + 1) };
+    }
+  } catch {
+    /* dir vanished */
+  }
+  return null;
+}
+
+function spawnCliDownload(
+  argv: string[],
+  timeoutMs: number,
+  onProgress: (pct: number, total: number, downloaded: number, speed?: number) => void
+): Promise<{ code: number; stderr: string; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let stderr = "";
+    let buf = "";
+    let timedOut = false;
+    let settled = false;
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(argv[0], argv.slice(1), {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+      });
+    } catch (e) {
+      resolve({ code: 1, stderr: String((e as Error).message || e), timedOut: false });
+      return;
+    }
+    const UNIT: Record<string, number> = { KiB: 1024, MiB: 1048576, GiB: 1073741824 };
+    proc.stdout!.on("data", (d) => {
+      buf += d.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+      for (const line of lines) {
+        // "[download]  34.5% of   10.00MiB at  1.20MiB/s ETA 00:05"
+        const m = line
+          .trim()
+          .match(/^\[download\]\s+([\d.]+)% of\s+~?([\d.]+)(KiB|MiB|GiB)(?:\s+at\s+([\d.]+)(KiB|MiB|GiB)\/s)?/);
+        if (m) {
+          const total = parseFloat(m[2]) * UNIT[m[3]];
+          const downloaded = (total * parseFloat(m[1])) / 100;
+          const speed = m[4] ? parseFloat(m[4]) * UNIT[m[5]] : undefined;
+          onProgress(parseFloat(m[1]), total, downloaded, speed);
+        }
+      }
+    });
+    proc.stderr!.on("data", (d) => {
+      stderr += d.toString();
+      if (stderr.length > 4000) stderr = stderr.slice(-4000);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }, timeoutMs);
+    proc.on("error", (e) => {
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        resolve({ code: 1, stderr: stderr || e.message, timedOut });
+      }
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        resolve({ code: code ?? 1, stderr, timedOut });
+      }
+    });
+  });
+}
+
+async function runYtDlpDownloadCli(
+  job: JobInternal,
+  opts: StartDlJobOpts,
+  format: string,
+  pctFrom: number,
+  pctTo: number,
+  firstCookie: string | null = null
+): Promise<YtDlpResult> {
+  const span = pctTo - pctFrom;
+  const deadline = Date.now() + JOB_TIMEOUT_MS;
+
+  const ck1 = firstCookie || getNextCookie();
+  const ck2 = getNextCookie();
+  const attempts: { ck: string | null; ca: string | null; label: string }[] = [];
+  if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, label: `${path.basename(ck1)}+clients` });
+  if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, label: `${path.basename(ck2)}+clients` });
+  if (ck1) attempts.push({ ck: ck1, ca: null, label: `${path.basename(ck1)}+default` });
+  attempts.push({ ck: null, ca: "tv,web_safari,android", label: "no-cookie+clients" });
+  attempts.push({ ck: null, ca: "mediaconnect", label: "no-cookie+mediaconnect" });
+
+  let lastErr = "";
+  for (let i = 0; i < attempts.length; i++) {
+    const at = attempts[i];
+    const remaining = deadline - Date.now();
+    if (remaining < 20_000) break;
+    // 429 during the walk: stop — more attempts only extend the throttle
+    if (i > 0 && /429|too many requests/i.test(lastErr)) break;
+
+    const myBase = path.join(os.tmpdir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.a${i}`);
+    const argv = [
+      ytDlpCliPath(),
+      ...cliBaseArgs(),
+      "--newline",
+      "--concurrent-fragments",
+      "4",
+      "--socket-timeout",
+      "25",
+      "--retries",
+      "3",
+      "--no-playlist",
+      "--ffmpeg-location",
+      resolveFfmpegBin(),
+    ];
+    const ck = at.ck ? writableCookiePath(at.ck) : null;
+    if (ck) argv.push("--cookies", ck);
+    if (at.ca) argv.push("--extractor-args", `youtube:player_client=${at.ca}`);
+    argv.push("-f", format, "-o", `${myBase}.%(ext)s`, opts.url);
+
+    const t0 = Date.now();
+    const r = await spawnCliDownload(argv, Math.min(remaining, 180_000), (pct, _total, downloaded, speed) => {
+      setPhase(job, pctFrom + (pct / 100) * span, downloaded, speed);
+    });
+    const done = pickFinalFile(myBase);
+    if (done) {
+      if (at.ck) markCookieGood(at.ck);
+      console.log(`[dl-walk ${i}] ${at.label} OK in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s (${done.size} bytes)`);
+      return done;
+    }
+    lastErr = r.timedOut ? "attempt timed out" : r.stderr.trim() ? cliErrSummary(r.stderr) : `exit ${r.code}`;
+    console.log(`[dl-walk ${i}] ${at.label} failed in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s: ${lastErr.slice(0, 120)}`);
+    // A challenged cookie cools down so later requests start elsewhere
+    if (at.ck && /sign in to confirm|not a bot/i.test(lastErr)) markCookieBlocked(at.ck, 120_000);
+  }
+  return { ok: false, error: `yt-dlp download failed: ${friendlyDlError(lastErr || "no output file")}` };
 }
 
 // ── local ffmpeg post-processing ──────────────────────────────────────
