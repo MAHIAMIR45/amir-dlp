@@ -7,8 +7,8 @@
 //     Used on Vercel where no python3 exists in the Node runtime.
 //
 // BOTH modes are 100% yt-dlp + cookies — no third-party download APIs.
-// Selection: VERCEL=1 → cli · YTDL_ENGINE=cli|python forces a mode ·
-// otherwise (z.ai / local dev) → python.
+// Selection: VERCEL=1 or RENDER=true → cli · YTDL_ENGINE=cli|python forces
+// a mode · otherwise (z.ai / local dev) → python.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -18,6 +18,19 @@ export function useCliEngine(): boolean {
   const forced = (process.env.YTDL_ENGINE || "").toLowerCase();
   if (forced === "cli") return true;
   if (forced === "python") return false;
+  // Serverless / container hosts ship no python3 in the Node runtime →
+  // use the self-contained yt-dlp binary (Vercel, Render, etc.).
+  return process.env.VERCEL === "1" || process.env.RENDER === "true";
+}
+
+/**
+ * True ONLY on hosts where in-memory job state cannot survive between
+ * requests (Vercel lambdas) → downloads must finish inside one request.
+ * Render is a persistent server: it keeps the job + progress-page flow,
+ * which avoids holding a single HTTP request open for minutes (Render's
+ * proxy would cut long requests mid-download).
+ */
+export function isServerlessHost(): boolean {
   return process.env.VERCEL === "1";
 }
 

@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.gitignore
+bun.lock
+dev.log
+server.log
+download
+scripts
+agent-ctx
+*.md
+Dockerfile
+.dockerignore
