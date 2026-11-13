@@ -1,8 +1,8 @@
-# --- Secrets & credentials (public repo safety) ---
+# --- Secrets & credentials ---
 .env
 .env.*
 !.env.example
-python/cookies/
+# python/cookies/ ko repo mein include kiya gaya hai (Vercel deployment ke liye, repo PRIVATE hai)
 
 # --- Node / Next.js build ---
 node_modules/
