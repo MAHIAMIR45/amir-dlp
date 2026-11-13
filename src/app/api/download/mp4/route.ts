@@ -1,9 +1,12 @@
-// GET /api/download/mp4 — start a WhatsApp-safe MP4 download job and show
-// the live progress page (polls /api/download/job, serves /api/download/file).
-// Engine: yt-dlp + cookies (python bridge on z.ai, standalone binary on Vercel).
+// GET /api/download/mp4 — WhatsApp-safe MP4 download.
+//  • z.ai (long-running host): background job + live progress page
+//  • Vercel (serverless): the whole download finishes inside THIS request
+//    and the file streams back directly (no cross-request job state exists)
+// Engine: yt-dlp + cookies in both modes.
 import { NextRequest } from "next/server";
-import { startDlJob } from "@/lib/media/dljobs";
-import { progressPageHtml, jsonError } from "@/lib/media/streaming";
+import { runDownloadSync, startDlJob } from "@/lib/media/dljobs";
+import { progressPageHtml, jsonError, serveTempFile } from "@/lib/media/streaming";
+import { useCliEngine } from "@/lib/media/engine";
 import { trackRequest } from "@/lib/tracker";
 
 export const dynamic = "force-dynamic";
@@ -32,8 +35,8 @@ export async function GET(req: NextRequest) {
     `${title.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "video"}` +
     `${height ? ` ${height}p` : ""}.mp4`;
 
-  const job = startDlJob({
-    mode: "mp4",
+  const jobOpts = {
+    mode: "mp4" as const,
     url,
     videoFormatId: vid,
     audioFormatId: aid,
@@ -41,7 +44,26 @@ export async function GET(req: NextRequest) {
     canCopy,
     filename: safeName,
     durationSec: dur && Number.isFinite(dur) ? dur : null,
-  });
-  trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 200 });
-  return progressPageHtml(job.id, safeName, "mp4");
+  };
+
+  try {
+    if (useCliEngine()) {
+      // Serverless mode — one request, one file.
+      const r = await runDownloadSync(jobOpts);
+      if (!r.ok || !r.filePath || !r.size) {
+        trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 502 });
+        return jsonError(r.error || "Download failed — please try again.");
+      }
+      trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 200 });
+      return serveTempFile(r.filePath, r.size, r.contentType || "video/mp4", safeName);
+    }
+
+    // Long-running host — background job with a live progress page.
+    const job = startDlJob(jobOpts);
+    trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 200 });
+    return progressPageHtml(job.id, safeName, "mp4");
+  } catch (e) {
+    trackRequest({ headers: req.headers, path: "/api/download/mp4", method: "GET", url, platform: "youtube", status: 500 });
+    return jsonError(`Download failed: ${(e as Error).message}`);
+  }
 }

@@ -777,3 +777,84 @@ async function runJob(job: JobInternal, opts: StartDlJobOpts): Promise<void> {
     cleanupFile(downloadedPath);
   }
 }
+
+// ── one-shot (serverless) pipeline ─────────────────────────────────────
+// On Vercel the in-memory job map cannot survive across requests, so the
+// download must complete INSIDE a single request. Same pipeline as runJob,
+// but awaitable and returning the finished file instead of registering a job.
+
+export interface SyncDlResult {
+  ok: boolean;
+  filePath?: string;
+  size?: number;
+  contentType?: string;
+  error?: string;
+}
+
+function statSize(p: string): number {
+  try {
+    return fs.statSync(p).size;
+  } catch {
+    return 0;
+  }
+}
+
+export async function runDownloadSync(opts: StartDlJobOpts): Promise<SyncDlResult> {
+  const job: JobInternal = {
+    id: crypto.randomBytes(8).toString("hex"),
+    state: "running",
+    filename: opts.filename,
+    contentType: opts.contentType || (opts.mode === "mp3" ? "audio/mpeg" : "video/mp4"),
+    createdAt: Date.now(),
+    pct: 0,
+    gotBytes: 0,
+    estBytes: opts.estBytes || undefined,
+  };
+  const durationSec = opts.durationSec ? Math.round(opts.durationSec) : null;
+  let downloadedPath: string | null = null;
+  try {
+    const dl = await runYtDlpDownload(job, opts, 0, opts.mode === "mp3" ? 80 : 88);
+    if (!dl.ok || !dl.path) return { ok: false, error: dl.error || "yt-dlp download failed" };
+    downloadedPath = dl.path;
+
+    if (opts.mode === "raw") {
+      const ct = dl.ext ? extContentType(dl.ext) : job.contentType;
+      return { ok: true, filePath: downloadedPath, size: statSize(downloadedPath), contentType: ct };
+    }
+
+    if (opts.mode === "mp3") {
+      const r = await audioToMp3Local(job, downloadedPath, durationSec, 80, 100);
+      cleanupFile(downloadedPath);
+      if (r.ok && r.filePath) {
+        return { ok: true, filePath: r.filePath, size: statSize(r.filePath), contentType: "audio/mpeg" };
+      }
+      return { ok: false, error: r.error || "MP3 conversion failed" };
+    }
+
+    const codecs = await probeCodecs(downloadedPath);
+    const copySafe = codecs ? codecs.video === "h264" && codecs.audio === "aac" : !!opts.canCopy;
+    if (copySafe) {
+      const r = await faststartRemux(downloadedPath);
+      if (r.ok && r.filePath) {
+        cleanupFile(downloadedPath);
+        return { ok: true, filePath: r.filePath, size: statSize(r.filePath), contentType: "video/mp4" };
+      }
+      const r2 = await reencodeLocal(job, downloadedPath, durationSec, 88, 98);
+      cleanupFile(downloadedPath);
+      if (r2.ok && r2.filePath) {
+        return { ok: true, filePath: r2.filePath, size: statSize(r2.filePath), contentType: "video/mp4" };
+      }
+      return { ok: false, error: r2.error || "Video conversion failed" };
+    }
+
+    const r = await reencodeLocal(job, downloadedPath, durationSec, 88, 98);
+    cleanupFile(downloadedPath);
+    if (r.ok && r.filePath) {
+      return { ok: true, filePath: r.filePath, size: statSize(r.filePath), contentType: "video/mp4" };
+    }
+    return { ok: false, error: r.error || "Video conversion failed" };
+  } catch (e) {
+    cleanupFile(downloadedPath);
+    return { ok: false, error: (e as Error).message };
+  }
+}
