@@ -265,7 +265,20 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
   const url = String(args.url || "");
   const cookiefile = (args.cookiefile as string | null) || null;
   const client = (args.client as string | null) || null;
-  const argv = [ytDlpCliPath(), ...cliBaseArgs(), "--ignore-no-formats-error", "--socket-timeout", "25", "--no-playlist", "-J"];
+  const argv = [
+    ytDlpCliPath(),
+    ...cliBaseArgs(),
+    "--ignore-no-formats-error",
+    "--socket-timeout",
+    "25",
+    "--no-playlist",
+    // Skip the watch-page + config roundtrips — goes straight to the player
+    // API. Cuts per-attempt time dramatically on slow shared-CPU hosts
+    // (Render free) where every spawn already costs 10-20s.
+    "--extractor-args",
+    "youtube:player_skip=webpage,configs",
+    "-J",
+  ];
   const ck = writableCookiePath(cookiefile);
   if (ck) argv.push("--cookies", ck);
   if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
