@@ -134,7 +134,7 @@ export async function GET(req: NextRequest) {
   // attempt — every debug visit otherwise hammers the player API and
   // extends the flag. An EXPLICIT &proxy= attempt bypasses the skip.
   const attempt = proxy
-    ? await runCliOne(url, cookiePath, client, proxy, 55_000)
+    ? await runCliOne(url, cookiePath, client, proxy, 110_000)
     : ipChallengedRecently()
     ? ({ ok: false, error: "skipped: server-IP challenge cooldown active (waiting it out)" } as Record<string, unknown>)
     : useCliEngine()

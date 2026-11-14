@@ -843,10 +843,11 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // 512MB Render instance: 2 concurrent yt-dlp spawns peak ~300MB — 3 would
   // risk the OOM killer. Bigger hosts race 3.
   const RACE = ON_RENDER ? 2 : 3;
-  // Validated successes land at 28-40s on Render; a healthy-but-slow proxy
-  // that needs more than 50s is almost always doomed anyway. Failing fast
-  // to the next route is what turns the old 2-3 min walks into ~30s ones.
-  const PROXY_CAP = ON_RENDER ? 50_000 : 40_000;
+  // Validated successes land at 28-40s on Render, but free proxies fluctuate
+  // minute-by-minute (a proxy clean at probe time can take 60-90s under
+  // load). 90s = generous enough to catch slow-but-working exits without
+  // burning the whole budget on a hopeless one.
+  const PROXY_CAP = ON_RENDER ? 90_000 : 40_000;
   // Round recipes: cookieLESS default extraction is the VALIDATED recipe
   // through clean proxy IPs (cookies + datacenter-exit combos trigger the
   // "sign in to confirm" challenge; without cookies the same proxy returns
@@ -872,8 +873,17 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       if (p && !batch.includes(p)) batch.push(p);
     }
     if (!batch.length) break;
-    const round = PROXY_ROUNDS[walkIdx++ % PROXY_ROUNDS.length];
-    const results = await Promise.all(batch.map((p) => attempt(round.ck, round.walk, p, PROXY_CAP)));
+    // MIX recipes across the batch (one fullskip = fast, one full = the
+    // validated complete-list shape): free-proxy exits are flaky, so every
+    // batch must maximise the chance that at least ONE member returns the
+    // complete format list instead of both betting on the same recipe.
+    const results = await Promise.all(
+      batch.map((p, i) => {
+        const round = PROXY_ROUNDS[(walkIdx + i) % PROXY_ROUNDS.length];
+        return attempt(round.ck, round.walk, p, PROXY_CAP);
+      })
+    );
+    walkIdx += batch.length;
     const full = results.find((r) => r && !isDegradedInfo(r));
     if (full) return full;
     for (const r of results) {
