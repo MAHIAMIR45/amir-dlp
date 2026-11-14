@@ -24,7 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cliBaseArgs, getNextProxy, healthyProxyCount, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
-import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, isRateLimitError, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
+import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, isProxyConnError, isRateLimitError, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
   id: string;
@@ -528,7 +528,7 @@ async function runYtDlpDownloadCli(
     const p = getNextProxy();
     if (!p || routes.includes(p)) break;
     routes.push(p);
-    if (routes.length >= 8) break; // cap per download job
+    if (routes.length >= 12) break; // cap per download job
   }
   const attempts: { ck: string | null; ca: string | null; proxy: string | null; label: string }[] = [];
   for (const rt of routes) {
@@ -633,6 +633,13 @@ async function runYtDlpDownloadCli(
       } else {
         markDirectBlocked();
       }
+      continue;
+    }
+    // Proxy tunnel refused/dropped — this proxy cannot carry media
+    // (CONNECT 403 on googlevideo). Cool it so the walk moves to a
+    // usable one and later jobs skip it from the start.
+    if (at.proxy && isProxyConnError(lastErr)) {
+      markProxyDead(at.proxy, 600_000);
       continue;
     }
     // A challenged cookie cools down so later requests start elsewhere

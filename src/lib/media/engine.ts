@@ -298,7 +298,12 @@ function checkProxyAlive(proxy: string, timeoutSec: number): Promise<boolean> {
  * CDN speed pass even for challenge-flagged IPs, and yt-dlp runs cost
  * minutes on Render. Mirrors yt-dlp's ANDROID client (v 21.26.364).
  */
-function probePlayerApi(proxy: string, timeoutSec: number): Promise<"clean" | "challenged" | "dead"> {
+interface ProbeResult {
+  verdict: "clean" | "challenged" | "dead";
+  mediaUrl: string | null; // a googlevideo URL from the response (media test)
+}
+
+function probePlayerApi(proxy: string, timeoutSec: number): Promise<ProbeResult> {
   const body = JSON.stringify({
     context: {
       client: {
@@ -334,24 +339,56 @@ function probePlayerApi(proxy: string, timeoutSec: number): Promise<"clean" | "c
       );
       let out = "";
       proc.stdout!.on("data", (d) => (out += d.toString()));
-      proc.on("error", () => resolve("dead"));
+      proc.on("error", () => resolve({ verdict: "dead", mediaUrl: null }));
       proc.on("close", () => {
         const i = out.indexOf("{");
-        if (i < 0) return resolve("dead");
+        if (i < 0) return resolve({ verdict: "dead", mediaUrl: null });
         try {
           const d = JSON.parse(out.slice(i));
-          if (d.error) return resolve("dead");
+          if (d.error) return resolve({ verdict: "dead", mediaUrl: null });
           const ps = d.playabilityStatus || {};
           const sd = d.streamingData || {};
           const fmts = (sd.formats || []).length + (sd.adaptiveFormats || []).length;
-          if (ps.status === "OK" && fmts > 0) return resolve("clean");
-          return resolve("challenged");
+          if (ps.status === "OK" && fmts > 0) {
+            // Grab a googlevideo media URL for the follow-up download test.
+            const all = [...(sd.adaptiveFormats || []), ...(sd.formats || [])];
+            const media = all.map((f: { url?: string }) => f.url || "").find((u: string) => u.includes("googlevideo.com")) || null;
+            return resolve({ verdict: "clean", mediaUrl: media });
+          }
+          return resolve({ verdict: "challenged", mediaUrl: null });
         } catch {
-          return resolve("dead");
+          return resolve({ verdict: "dead", mediaUrl: null });
         }
       });
     } catch {
-      resolve("dead");
+      resolve({ verdict: "dead", mediaUrl: null });
+    }
+  });
+}
+
+/**
+ * MEDIA check — the decisive one: several proxies allow the player API but
+ * 403 the googlevideo CONNECT tunnel (listings work, downloads die). Pull
+ * ~800KB of actual media through the proxy and require real throughput.
+ */
+function checkMediaThroughProxy(proxy: string, mediaUrl: string, timeoutSec: number): Promise<number> {
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn(
+        "curl",
+        ["-x", proxy, "--max-time", String(timeoutSec), "-o", "/dev/null", "-sS", "-w", "%{http_code} %{speed_download}", "-r", "0-799999", mediaUrl],
+        { stdio: ["ignore", "pipe", "pipe"], timeout: (timeoutSec + 4) * 1000 }
+      );
+      let out = "";
+      proc.stdout!.on("data", (d) => (out += d.toString()));
+      proc.on("error", () => resolve(0));
+      proc.on("close", () => {
+        const [code, speed] = out.trim().split(/\s+/);
+        const v = parseFloat(speed || "0");
+        resolve(code === "206" || code === "200" ? (Number.isFinite(v) ? v : 0) : 0);
+      });
+    } catch {
+      resolve(0);
     }
   });
 }
@@ -421,13 +458,27 @@ export async function refreshProxyPool(): Promise<number> {
 
   // THE filter: does this proxy's exit IP get a full player response?
   const probeN = Math.min(alive.length, 90);
-  const verdicts = await runMap(alive.slice(0, probeN), 20, (p) => probePlayerApi(`http://${p}`, 12));
-  const clean = alive.slice(0, probeN).filter((_, i) => verdicts[i] === "clean");
+  const probes = await runMap(alive.slice(0, probeN), 20, (p) => probePlayerApi(`http://${p}`, 12));
+  const clean = alive.slice(0, probeN).filter((_, i) => probes[i].verdict === "clean");
   if (!clean.length) return 0;
 
-  // Rank the clean ones by CDN throughput (media must actually move).
-  const speeds = await runMap(clean, 12, (p) => proxyThroughput(`http://${p}`));
-  const ranked = clean
+  // MEDIA filter — the proxy must actually move googlevideo bytes
+  // (CONNECT 403 on media endpoints is common and kills all downloads).
+  const probePairs = alive
+    .slice(0, probeN)
+    .map((p, i) => ({ p, mediaUrl: probes[i]?.mediaUrl || null }))
+    .filter((x) => x.mediaUrl);
+  const mediaChecks = await runMap(
+    probePairs,
+    12,
+    (x) => checkMediaThroughProxy(`http://${x.p}`, x.mediaUrl as string, 14)
+  );
+  const mediaOk = probePairs.filter((_, i) => (mediaChecks[i] || 0) > 0).map((x) => x.p);
+  const finalList = mediaOk.length ? mediaOk : clean; // media-validated first; else keep probe-clean
+
+  // Rank by CDN throughput (media must actually move).
+  const speeds = await runMap(finalList, 12, (p) => proxyThroughput(`http://${p}`));
+  const ranked = finalList
     .map((p, i) => ({ p, v: speeds[i] || 0 }))
     .sort((a, b) => b.v - a.v);
   const final = ranked.slice(0, 28).map((x) => x.p);

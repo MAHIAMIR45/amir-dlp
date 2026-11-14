@@ -511,7 +511,7 @@ const _gBlock = globalThis as unknown as {
   __ytDirectBlockedUntil?: number;
 };
 const IP_CHALLENGE_COOLDOWN_MS = 300_000; // 5 min — challenges usually decay
-const DIRECT_BLOCKED_MS = 600_000; // 10 min — remember the direct IP is flagged
+const DIRECT_BLOCKED_MS = 1_800_000; // 30 min — remember the direct IP is flagged (the challenge persists for hours, and every re-probe costs users ~50s)
 
 export function markIpChallenged(): void {
   _gBlock.__ytIpChallengeUntil = Date.now() + IP_CHALLENGE_COOLDOWN_MS;
@@ -536,6 +536,12 @@ function blockedRecently(): boolean {
 
 export function isIpChallenge(err: string): boolean {
   return /failed to extract any player response/i.test(err);
+}
+
+/** The proxy itself refused/dropped the tunnel (CONNECT 403, dead host) —
+ *  these proxies can list but cannot move media; cool them down. */
+export function isProxyConnError(err: string): boolean {
+  return /unable to connect to proxy|tunnel connection failed|proxy.+refused|proxy.+timeout/i.test(err);
 }
 
 // ── Public API ────────────────────────────────────────────────────────
@@ -725,6 +731,13 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
         markDirectBlocked();
         if (!healthyProxyCount()) markIpChallenged();
       }
+      return null;
+    }
+    // Proxy tunnel refused/dropped — the proxy cannot carry this traffic
+    // (some allow the player API but 403 googlevideo CONNECTs). Cool it so
+    // later walks skip straight to usable proxies.
+    if (proxy && isProxyConnError(lastError)) {
+      markProxyDead(proxy, 600_000);
       return null;
     }
     if (cookiefile) {
