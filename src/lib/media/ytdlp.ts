@@ -916,6 +916,14 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     const results = await Promise.all(
       batch.map((p, i) => {
         const round = PROXY_ROUNDS[(walkIdx + i) % PROXY_ROUNDS.length];
+        // The LOCAL WARP tunnel is a dedicated, fast link (multi-MB/s): the
+        // FULL default walk (watch page + configs → signature timestamp) is
+        // the shape VERIFIED to return the complete list from its SG egress
+        // (fastskip gets challenge-lite there even though it works from
+        // other clean exits). Free proxies stay on the fast recipes.
+        if (isLocalProxy(p)) {
+          return attempt(null, "full", p, PROXY_CAP);
+        }
         return attempt(round.ck, round.walk, p, PROXY_CAP);
       })
     );

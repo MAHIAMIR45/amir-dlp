@@ -547,10 +547,14 @@ async function runYtDlpDownloadCli(
         });
         if (pinnedCk) attempts.push({ ck: null, ca: opts.clientWalk, proxy: rt, label: `no-cookie+${opts.clientWalk.split(",")[0]}…@pinned-proxy` });
       }
-      // fastskip first on every proxy route: pre-signed clients (tv/ios/
-      // android) return full format lists in seconds without the watch
-      // page or configs — the validated fast recipe through clean exits.
-      attempts.push({ ck: null, ca: "fastskip", proxy: rt, label: "no-cookie+fastskip@proxy" });
+      // Local WARP tunnel: FULL walk first — the verified shape from its
+      // SG egress (fastskip gets challenge-lite there). Free proxies:
+      // fastskip first (fast pre-signed recipe).
+      if (isLocalProxy(rt)) {
+        attempts.push({ ck: null, ca: "full", proxy: rt, label: "no-cookie+full@warp" });
+      } else {
+        attempts.push({ ck: null, ca: "fastskip", proxy: rt, label: "no-cookie+fastskip@proxy" });
+      }
       attempts.push({ ck: null, ca: DL_CLIENT_WALK, proxy: rt, label: "no-cookie+clients@proxy" });
       if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients@proxy` });
       if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients@proxy` });
