@@ -241,10 +241,18 @@ def _run_info_inner(url, cookiefile, client, logger):
     }
     if cookiefile:
         opts["cookiefile"] = cookiefile
-    # client == "full" means the DEFAULT extraction (no overrides) — the
-    # python engine already runs that, so there is nothing to set.
-    if client and client != "full":
-        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+    # Walk modes from the Node layer:
+    #   "full"     = default extraction (no overrides)
+    #   "fullskip" = skip the watch page, keep the player configs (the
+    #                request shape that returns FULL format lists)
+    #   other      = explicit player client override
+    ea = {}
+    if client == "fullskip":
+        ea["player_skip"] = ["webpage"]
+    elif client and client not in ("full",):
+        ea["player_client"] = [client]
+    if ea:
+        opts["extractor_args"] = {"youtube": ea}
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:

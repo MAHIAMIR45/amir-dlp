@@ -287,14 +287,22 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
     "25",
     "--no-playlist",
   ];
-  // "full" = completely default extraction (watch page + player configs +
-  // default client priority walk). Through CLEAN proxy IPs this is what
-  // returns the FULL format list — the fast player_skip walk below is
-  // served challenge-lite/degraded responses (1-2 itags) by YouTube even
-  // from clean IPs, while the default flow gets everything (47 formats
-  // verified through a validated proxy). Direct attempts on clean server
-  // IPs use the fast walk first (speed), then "full" as an upgrade shot.
-  if (client !== "full") {
+  // Walk modes:
+  //  · "full"     = completely default (watch page + configs + default
+  //                 client walk). Complete lists but the 1-2MB watch page
+  //                 is too slow through ~40KB/s public proxies.
+  //  · "fullskip" = player_skip=webpage ONLY (configs still fetched).
+  //                 THE SWEET SPOT: default client order + signature
+  //                 timestamp from the configs returns the FULL format
+  //                 list (verified 48 formats / 4K through a validated
+  //                 proxy) at player-API-only speed.
+  //  · (default)  = player_skip=webpage,configs + optional client walk —
+  //                 fastest, but challenge-lite/degraded on flagged IPs.
+  if (client === "full") {
+    // no extractor-args at all
+  } else if (client === "fullskip") {
+    argv.push("--extractor-args", "youtube:player_skip=webpage");
+  } else {
     argv.push(
       "--extractor-args",
       "youtube:player_skip=webpage,configs",
@@ -303,7 +311,7 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
   argv.push("-J");
   const ck = writableCookiePath(cookiefile);
   if (ck) argv.push("--cookies", ck);
-  if (client && client !== "full") argv.push("--extractor-args", `youtube:player_client=${client}`);
+  if (client && client !== "full" && client !== "fullskip") argv.push("--extractor-args", `youtube:player_client=${client}`);
   if (proxy) argv.push("--proxy", proxy);
   argv.push(url);
   const r = await spawnCli(argv, timeoutMs);
@@ -576,9 +584,12 @@ export function isDegradedInfo(info: YtInfo | null | undefined): boolean {
   const vo = info.video_only?.length || 0;
   const ao = info.audio_only?.length || 0;
   const co = info.combined?.length || 0;
-  if (vo >= 3) return false; // full adaptive list
-  if (ao >= 2 && co >= 1) return false; // reasonable audio + video
-  return vo + ao + co <= 3;
+  if (vo >= 3) return false; // full adaptive (DASH) list
+  if (ao >= 2 && co >= 1) return false; // reasonable audio + video rows
+  // A healthy player response carries a DASH video-only list; responses
+  // with a handful of HLS/combined itags and no video-only rows are the
+  // lite serving — keep walking for the complete list.
+  return true;
 }
 // Slow shared-CPU hosts (Render free) need bigger values — one yt-dlp spawn
 // costs 10-20s there and a 7-client walk needs 60-120s, so the fast-host
@@ -782,11 +793,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     if (accept(r)) return r;
     if (blockedRecently() && !haveProxies) throwBlocked();
     // The fast walk returned only a challenge-lite list (or nothing) —
-    // one "full" (default extraction) upgrade shot before moving on: it
-    // fetches watch page + player configs, which is exactly what returns
-    // complete format lists.
+    // one "fullskip" (skip watch page, keep configs → signature timestamp
+    // → default client walk returns the FULL list) upgrade shot.
     if (inBudget() && !blockedRecently()) {
-      const rf = await attempt(st_lastGood(), "full");
+      const rf = await attempt(st_lastGood(), "fullskip");
       if (accept(rf)) return rf;
     }
   }
@@ -823,10 +833,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // the full 47-format list). Cookie batches ride along for age-gated
   // videos, then alternate client walks as fallbacks.
   const PROXY_ROUNDS: { walk: string; ck: string | null }[] = [
+    { walk: "fullskip", ck: null },
+    { walk: "fullskip", ck: proxyCookie },
     { walk: "full", ck: null },
-    { walk: "full", ck: proxyCookie },
     { walk: "ios,android,tv", ck: null },
-    { walk: "mweb,web", ck: null },
   ];
   let walkIdx = 0;
   for (;;) {

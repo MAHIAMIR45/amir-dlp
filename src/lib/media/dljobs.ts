@@ -596,10 +596,14 @@ async function runYtDlpDownloadCli(
     ];
     const ck = at.ck ? writableCookiePath(at.ck) : null;
     if (ck) argv.push("--cookies", ck);
-    // "full" = default extraction (no player_client override) — needed when
-    // the pinned listing route used the full-default flow (clean proxies
-    // serve full format lists only to that request shape).
-    if (at.ca && at.ca !== "full") argv.push("--extractor-args", `youtube:player_client=${at.ca}`);
+    // Walk modes: "full" = default (no overrides); "fullskip" = skip the
+    // watch page but keep the player configs (the walk that returns FULL
+    // format lists through clean proxies); anything else = client walk.
+    if (at.ca === "fullskip") {
+      argv.push("--extractor-args", "youtube:player_skip=webpage");
+    } else if (at.ca && at.ca !== "full") {
+      argv.push("--extractor-args", `youtube:player_client=${at.ca}`);
+    }
     if (at.proxy) argv.push("--proxy", at.proxy);
     argv.push("-f", format, "-o", `${myBase}.%(ext)s`, opts.url);
 
