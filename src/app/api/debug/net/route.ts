@@ -4,6 +4,7 @@
 //   &host=<h>&port=<p>  custom TCP probe
 // Read-only diagnostics — reports success/latency only.
 import { NextRequest } from "next/server";
+import { spawn } from "node:child_process";
 import dgram from "node:dgram";
 import net from "node:net";
 
@@ -71,6 +72,37 @@ function tcpProbe(host: string, port: number, timeoutMs = 8000): Promise<{ ok: b
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const results: Record<string, unknown> = {};
+
+  if (sp.get("warp") === "1") {
+    // Trace through the local wireproxy tunnel: warp=on proves the tunnel
+    // is up and carrying traffic; ip= shows the WARP egress address.
+    // (Node fetch cannot dial socks5 — spawn curl like the pool probes do.)
+    const t0 = Date.now();
+    results.warp_tunnel = await new Promise<Record<string, unknown>>((resolve) => {
+      try {
+        const p = spawn(
+          "curl",
+          ["-sS", "-m", "12", "-x", "socks5://127.0.0.1:40000", "https://www.cloudflare.com/cdn-cgi/trace"],
+          { stdio: ["ignore", "pipe", "pipe"], timeout: 16_000 }
+        );
+        let out = "";
+        p.stdout!.on("data", (d) => (out += d.toString()));
+        p.on("error", (e) => resolve({ ok: false, error: e.message }));
+        p.on("close", () => {
+          const pick = (k: string) => out.split("\n").find((l) => l.startsWith(k + "="))?.trim();
+          resolve({
+            ok: pick("warp") === "warp=on",
+            ms: Date.now() - t0,
+            warp: pick("warp") || null,
+            ip: pick("ip") || null,
+            loc: pick("loc") || null,
+          });
+        });
+      } catch (e) {
+        resolve({ ok: false, error: (e as Error).message });
+      }
+    });
+  }
 
   if (sp.get("udp") === "1") results.udp_dns_1_1_1_1 = await udpDnsProbe();
   const tcpHost = sp.get("host");

@@ -1,6 +1,7 @@
-# Bootstrap seed — MUST be reachable from the DEPLOY HOST (Render), not just
-# the dev sandbox. These two passed CONNECT + innertube player probes FROM
-# Render (refresh at 04:45 UTC). The real pool is built at runtime from
-# public lists via refreshProxyPool() (validated from the host's network).
+# PRIMARY: local Cloudflare WARP tunnel (wireproxy spawned by engine.ts at
+# boot). Consumer-grade exit IP — YouTube does not bot-challenge it like
+# Render's datacenter IP. Fallbacks: free public proxies (refresh rebuilds
+# them from public lists, validated from the host's own network).
+socks5://127.0.0.1:40000
 http://125.26.165.245:8080
 http://45.232.0.2:8080

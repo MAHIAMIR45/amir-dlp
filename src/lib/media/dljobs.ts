@@ -23,7 +23,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cliBaseArgs, getNextProxy, healthyProxyCount, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
+import { cliBaseArgs, getNextProxy, healthyProxyCount, isLocalProxy, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
 import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, isProxyConnError, isRateLimitError, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
@@ -629,8 +629,10 @@ async function runYtDlpDownloadCli(
     console.log(`[dl-walk ${i}] ${at.label} failed in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s: ${lastErr.slice(0, 120)}`);
     // Timed-out proxy = black-holed tunnel — cool it so the walk moves to
     // a usable exit instead of re-picking the same silent dead proxy.
+    // The local WARP tunnel gets a short cooldown (dedicated exit; a boot
+    // handshake delay must not bench it for long).
     if (r.timedOut && at.proxy) {
-      markProxyDead(at.proxy, 600_000);
+      markProxyDead(at.proxy, isLocalProxy(at.proxy) ? 180_000 : 600_000);
       continue;
     }
     // 429 on THIS route: cool the offending exit IP only.
@@ -649,7 +651,7 @@ async function runYtDlpDownloadCli(
     const softChallenged = /temporarily blocking|may be blocking|no downloadable formats/i.test(lastErr);
     if (isIpChallenge(lastErr) || (at.proxy && (/sign in to confirm|not a bot/i.test(lastErr) || softChallenged))) {
       if (at.proxy) {
-        markProxyDead(at.proxy, 600_000); // 10 min
+        markProxyDead(at.proxy, isLocalProxy(at.proxy) ? 180_000 : 600_000); // 10 min (public) / 3 min (WARP)
       } else {
         markDirectBlocked();
       }

@@ -198,11 +198,60 @@ function loadProxies(): ProxySlot[] {
   }
   const final = runtime.length ? [...new Set([...runtime, ...urls])] : urls;
   st.mtimeKey = key;
-  st.slots = [...new Set(final)].map((url) => ({ url, deadUntil: 0 }));
+  // The LOCAL WARP tunnel (wireproxy on 127.0.0.1) always goes FIRST — it
+  // is a dedicated clean exit, not a shared public proxy. Everything else
+  // (runtime refresh output, seed) follows as fallback.
+  st.slots = [...new Set(final)]
+    .sort((a, b) => Number(isLocalProxy(b)) - Number(isLocalProxy(a)))
+    .map((url) => ({ url, deadUntil: 0 }));
   st.idx = 0;
   if (st.lastGood && !st.slots.some((s) => s.url === st.lastGood)) st.lastGood = null;
   return st.slots;
 }
+
+/** Local wireproxy tunnel — a dedicated exit, never treated as public pool. */
+export function isLocalProxy(url: string): boolean {
+  return /\/\/127\.0\.0\.1:|\/\/localhost:/i.test(url);
+}
+
+// ── Local WARP tunnel (wireproxy, userspace WireGuard) ───────────────
+// Render's datacenter IP is player-challenged by YouTube and free public
+// proxies are slow/flagged within hours. A Cloudflare WARP tunnel via the
+// bundled wireproxy binary gives the app a DEDICATED consumer-grade exit
+// at socks5://127.0.0.1:40000 — verified 48 formats / 4K in ~3.5s with
+// multi-MB/s media throughput. wireproxy needs no root and no kernel
+// module, so it runs fine on Render's native runtime.
+function ensureWarpTunnel(): void {
+  const g = globalThis as unknown as { __warpTunnelSpawned?: boolean };
+  if (g.__warpTunnelSpawned) return;
+  g.__warpTunnelSpawned = true;
+  if (process.env.RENDER !== "true" && process.env.WARP_TUNNEL !== "1") return;
+  try {
+    const bin = path.join(process.cwd(), "bin", "warp", "wireproxy");
+    const conf = path.join(process.cwd(), "bin", "warp", "wireproxy.conf");
+    if (!fs.existsSync(bin) || !fs.existsSync(conf)) {
+      console.log("[warp] wireproxy bundle missing — tunnel not started");
+      return;
+    }
+    ensureExec(bin);
+    // detached + unref: the tunnel outlives this process (redeploys kill
+    // the instance; an orphan still holding :40000 just keeps serving —
+    // a second spawn would fail to bind and exit harmlessly).
+    const child = spawn(bin, ["-c", conf], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env },
+    });
+    child.unref();
+    console.log("[warp] wireproxy spawned → socks5://127.0.0.1:40000");
+  } catch (e) {
+    console.log(`[warp] tunnel spawn failed: ${(e as Error).message}`);
+  }
+}
+
+// Start the tunnel as early as possible (module init) so the first user
+// request already has it available (handshake needs ~2-5s).
+ensureWarpTunnel();
 
 function healthySlots(): ProxySlot[] {
   const now = Date.now();

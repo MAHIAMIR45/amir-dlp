@@ -9,6 +9,7 @@ import {
   ensureProxyPoolOnce,
   getNextProxy,
   healthyProxyCount,
+  isLocalProxy,
   markProxyDead,
   markProxyGood,
   refreshProxyPoolAsync,
@@ -735,8 +736,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     // answers). Without cooling it down it stayed "healthy" and every later
     // batch re-picked it, burning 60-90s of the budget EACH time — the exact
     // "stuck for minutes with nothing happening" the API users reported.
+    // The LOCAL WARP tunnel gets a short cooldown: it is the dedicated exit,
+    // and a transient boot-time handshake delay must not bench it for long.
     if (proxy && /^extraction timed out/i.test(lastError)) {
-      markProxyDead(proxy, 600_000); // 10 min — re-probe later
+      markProxyDead(proxy, isLocalProxy(proxy) ? 180_000 : 600_000);
       return null;
     }
 
@@ -762,7 +765,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     const softChallenged = /temporarily blocking this server|may be blocking this server/i.test(lastError);
     if (isIpChallenge(lastError) || (proxy && (isBotChallenge(lastError) || softChallenged))) {
       if (proxy) {
-        markProxyDead(proxy, 600_000); // 10 min
+        markProxyDead(proxy, isLocalProxy(proxy) ? 180_000 : 600_000); // 10 min (public) / 3 min (WARP)
       } else {
         markDirectBlocked();
         if (!healthyProxyCount()) markIpChallenged();
