@@ -487,21 +487,24 @@ export async function ytSearch(q: string, limit = 12): Promise<{ results: Search
 }
 
 const FALLBACK_CLIENTS = ["tv", "web_safari", "android", "ios", "mweb", "web", "tv_embedded"];
-// extract.py has an INTERNAL 22s watchdog (python engine), so every attempt
-// ends itself; the JS-side caps below are the hard limits for the CLI engine.
-// Slow shared-CPU hosts (Render free) need bigger values — override via env:
-//   YTDL_EXTRACT_TIMEOUT_MS  per-attempt cap (default 25s)
-//   YTDL_MEDIACONNECT_TIMEOUT_MS  mediaconnect attempt cap (default 28s)
-//   YTDL_EXTRACT_BUDGET_MS   total walk budget (default 60s)
-//   YTDL_SEARCH_TIMEOUT_MS   ytsearch cap (default 40s)
-const EXTRACT_TIMEOUT = Number(process.env.YTDL_EXTRACT_TIMEOUT_MS || "") || 25_000;
-const MEDIACONNECT_TIMEOUT = Number(process.env.YTDL_MEDIACONNECT_TIMEOUT_MS || "") || 28_000;
+// Slow shared-CPU hosts (Render free) need bigger values — one yt-dlp spawn
+// costs 10-20s there and a 7-client walk needs 60-120s, so the fast-host
+// caps killed EVERY attempt mid-flight and the user just saw endless
+// loading. Env vars (set on the Render service) win; defaults below mirror
+// them so a lost env var cannot regress this again:
+//   YTDL_EXTRACT_TIMEOUT_MS  per-attempt cap (Render default 120s)
+//   YTDL_MEDIACONNECT_TIMEOUT_MS  mediaconnect attempt cap (Render 130s)
+//   YTDL_EXTRACT_BUDGET_MS   total walk budget (Render 210s — the frontend
+//                            aborts at 240s, keep 30s of headroom)
+//   YTDL_SEARCH_TIMEOUT_MS   ytsearch cap (default 40s / Render 80s)
+const ON_RENDER = process.env.RENDER === "true";
+const EXTRACT_TIMEOUT = Number(process.env.YTDL_EXTRACT_TIMEOUT_MS || "") || (ON_RENDER ? 120_000 : 25_000);
+const MEDIACONNECT_TIMEOUT = Number(process.env.YTDL_MEDIACONNECT_TIMEOUT_MS || "") || (ON_RENDER ? 130_000 : 28_000);
 // Total walk budget: worst case = budget + one overrunning attempt.
 // On Vercel this MUST stay under the function limit — a request that
 // outlives it returns an opaque HTML 502 and the phone spins forever.
-// Render web services allow very long requests (no 60s lambda cap),
-// so production there raises the budget via env (currently 120s).
-const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || 60_000;
+// Render web services allow very long requests (no lambda cap).
+const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || (ON_RENDER ? 210_000 : 60_000);
 // One yt-dlp invocation walks these clients INTERNALLY (comma list) and
 // stops at the first client that yields playable formats. On slow shared-CPU
 // hosts (Render free) every spawn costs ~10-20s, so a comma-list attempt is
@@ -555,8 +558,13 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   }
 
   const budgetStart = Date.now();
-  const inBudget = () => Date.now() - budgetStart < EXTRACT_BUDGET;
-  const remaining = () => Math.max(8_000, EXTRACT_BUDGET - (Date.now() - budgetStart));
+  // Never START an attempt that cannot finish: with less than MIN_ATTEMPT_MS
+  // left in the budget the next spawn would just be killed mid-flight and the
+  // user would see a confusing "extraction timed out after 8s" error. Skip
+  // it instead — one meaningful attempt is worth more than a doomed one.
+  const MIN_ATTEMPT_MS = 30_000;
+  const inBudget = () => EXTRACT_BUDGET - (Date.now() - budgetStart) >= MIN_ATTEMPT_MS;
+  const remaining = () => EXTRACT_BUDGET - (Date.now() - budgetStart);
   let lastError = "extraction failed";
   // Per-attempt diagnostics — written to /tmp/extract_debug.log so the
   // /api/debug/extract route can show WHY production extraction fails
