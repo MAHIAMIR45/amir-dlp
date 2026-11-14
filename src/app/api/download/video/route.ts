@@ -1,8 +1,9 @@
 // GET /api/download/video?url= — YouTube format listing (Video+Audio /
 // Video Only / Audio Only tabs). 100% yt-dlp + cookies engine.
+// Cache-first: repeat listings for the same video answer instantly.
 import { NextRequest } from "next/server";
-import { ytInfoWithFallback, type FormatEntry, type YtInfo } from "@/lib/media/ytdlp";
-import { cacheInfo } from "@/lib/media/formatcache";
+import { isDegradedInfo, ytInfoWithFallback, type FormatEntry, type YtInfo } from "@/lib/media/ytdlp";
+import { cacheInfo, getCachedInfo } from "@/lib/media/formatcache";
 import { trackRequest } from "@/lib/tracker";
 
 export const dynamic = "force-dynamic";
@@ -74,8 +75,27 @@ export async function GET(req: NextRequest) {
   }
 
   try {
+    // Cache-first: a previous FULL (non-degraded) listing answers instantly.
+    const cached = getCachedInfo(url);
+    if (cached && !isDegradedInfo(cached)) {
+      trackRequest({ headers: req.headers, path: "/api/download/video", method: "GET", url, platform: "youtube", status: 200 });
+      return videoListingResponse(cached, url, true);
+    }
     const info: YtInfo = await ytInfoWithFallback(url);
     cacheInfo(url, info);
+    trackRequest({ headers: req.headers, path: "/api/download/video", method: "GET", url, platform: "youtube", status: 200 });
+    return videoListingResponse(info, url, false);
+  } catch (e) {
+    const msg = (e as Error).message || "Extraction failed";
+    trackRequest({ headers: req.headers, path: "/api/download/video", method: "GET", url, platform: "youtube", status: 502 });
+    return new Response(JSON.stringify({ status: "error", error: msg }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+function videoListingResponse(info: YtInfo, url: string, fromCache: boolean): Response {
     const title = sanitizeTitle(info.title);
     const dur = info.duration_sec ?? null;
     const audioBest = (info.audio_only || [])[0] || null;
@@ -156,7 +176,6 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    trackRequest({ headers: req.headers, path: "/api/download/video", method: "GET", url, platform: "youtube", status: 200 });
     return new Response(
       JSON.stringify({
         status: "ok",
@@ -166,6 +185,7 @@ export async function GET(req: NextRequest) {
         channel: info.channel,
         backup: false,
         _backup_url: url,
+        cached: fromCache,
         formats: {
           video_audio: vaRows,
           video_only: voRows,
@@ -175,12 +195,4 @@ export async function GET(req: NextRequest) {
       }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
-  } catch (e) {
-    const msg = (e as Error).message || "Extraction failed";
-    trackRequest({ headers: req.headers, path: "/api/download/video", method: "GET", url, platform: "youtube", status: 502 });
-    return new Response(JSON.stringify({ status: "error", error: msg }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
 }

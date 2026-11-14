@@ -626,12 +626,15 @@ async function runYtDlpDownloadCli(
       else markDirectBlocked();
       continue;
     }
-    // All player clients refused:
+    // All player clients refused / soft-challenged (the friendly wording
+    // "temporarily blocking" also wraps raw sign-in errors, and raw
+    // "no downloadable formats" is the challenge-lite serving):
     //  · via proxy → this proxy's IP is flagged too — cool it down, try
     //    the next route (downloads just keep walking the pool).
     //  · direct → remember the server IP is flagged; remaining DIRECT
     //    attempts are skipped, proxy routes continue.
-    if (isIpChallenge(lastErr) || (at.proxy && /sign in to confirm|not a bot/i.test(lastErr))) {
+    const softChallenged = /temporarily blocking|may be blocking|no downloadable formats/i.test(lastErr);
+    if (isIpChallenge(lastErr) || (at.proxy && (/sign in to confirm|not a bot/i.test(lastErr) || softChallenged))) {
       if (at.proxy) {
         markProxyDead(at.proxy, 600_000); // 10 min
       } else {

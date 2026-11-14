@@ -5,6 +5,8 @@
 //   ?url=<youtube-url>          run ONE live extraction attempt (default URL)
 //   &cookie=<basename|first>    which cookie file to use (default: first)
 //   &client=<name|none>         player client override (default: none)
+//   &proxy=<url|none>           route the attempt through this proxy
+//                               (bypasses the challenge-cooldown skip)
 //   &log=1                      tail the extraction debug log instead
 //
 // Read-only diagnostics — never exposes cookie contents, only timings,
@@ -98,6 +100,8 @@ export async function GET(req: NextRequest) {
   const cookiePath = which && which !== "none" ? path.join(cookieDir(), which) : null;
   const clientParam = sp.get("client");
   const client = !clientParam || clientParam === "none" ? null : clientParam;
+  const proxyParam = sp.get("proxy");
+  const proxy = proxyParam && proxyParam !== "none" ? proxyParam : null;
 
   const envInfo = {
     engine: useCliEngine() ? "cli" : "python",
@@ -126,16 +130,19 @@ export async function GET(req: NextRequest) {
 
   // Vercel has no python3 — run the standalone yt-dlp binary instead of
   // extract.py and return a COMPACT summary (the -J payload is huge).
-  // During an active server-IP challenge, do NOT spawn another attempt —
-  // every debug visit otherwise hammers the player API and extends the flag.
-  const attempt = ipChallengedRecently()
+  // During an active server-IP challenge, do NOT spawn another DIRECT
+  // attempt — every debug visit otherwise hammers the player API and
+  // extends the flag. An EXPLICIT &proxy= attempt bypasses the skip.
+  const attempt = proxy
+    ? await runCliOne(url, cookiePath, client, proxy, 55_000)
+    : ipChallengedRecently()
     ? ({ ok: false, error: "skipped: server-IP challenge cooldown active (waiting it out)" } as Record<string, unknown>)
     : useCliEngine()
-    ? await runCliOne(url, cookiePath, client, 40_000)
+    ? await runCliOne(url, cookiePath, client, null, 40_000)
     : await runOne({ mode: "info", url, cookiefile: cookiePath, client }, 40_000);
 
   return new Response(
-    JSON.stringify({ env: envInfo, url, cookie: cookiePath ? which : null, client, attempt }, null, 2),
+    JSON.stringify({ env: envInfo, url, cookie: cookiePath ? which : null, client, proxy, attempt }, null, 2),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
 }
@@ -144,6 +151,7 @@ async function runCliOne(
   url: string,
   cookiePath: string | null,
   client: string | null,
+  proxy: string | null,
   timeoutMs: number
 ): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -167,6 +175,7 @@ async function runCliOne(
       const ck = writableCookiePath(cookiePath);
       if (ck) argv.push("--cookies", ck);
       if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
+      if (proxy) argv.push("--proxy", proxy);
       argv.push(url);
       const proc = spawn(argv[0], argv.slice(1), {
         stdio: ["ignore", "pipe", "pipe"],

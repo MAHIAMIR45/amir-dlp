@@ -537,6 +537,13 @@ export function directBlockedRecently(): boolean {
   return (_gBlock.__ytDirectBlockedUntil || 0) > Date.now();
 }
 
+// Render's datacenter IP has been player-challenged for days at a stretch;
+// the flag outlives redeploys and every cold-boot probe costs the FIRST
+// visitor ~50s of doomed direct walking before the proxy rounds take over.
+// Assume blocked at boot — after 30 min the flag decays and one natural
+// probe happens; a CLEAN direct IP then takes over automatically.
+if (process.env.RENDER === "true" && !directBlockedRecently()) markDirectBlocked();
+
 /** Either YouTube-side throttle is active — stop walking immediately. */
 function blockedRecently(): boolean {
   return rateLimitedRecently() || ipChallengedRecently();
@@ -733,15 +740,25 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       }
       return null;
     }
-    // Server-IP challenge (all player clients refused) and bot checks are
-    // also per EXIT-IP: cool the offending route, never the whole world.
-    if (isIpChallenge(lastError) || (proxy && isBotChallenge(lastError))) {
+    // The FRIENDLY wording ("YouTube is temporarily blocking this server's
+    // extraction") wraps the raw sign-in/challenge errors. Through a proxy
+    // it means THAT exit IP is challenged — without matching it here the
+    // flagged proxy stayed in rotation and later attempts re-hit it
+    // (15-40s wasted each time, the exact slowness users reported).
+    const softChallenged = /temporarily blocking this server|may be blocking this server/i.test(lastError);
+    if (isIpChallenge(lastError) || (proxy && (isBotChallenge(lastError) || softChallenged))) {
       if (proxy) {
         markProxyDead(proxy, 600_000); // 10 min
       } else {
         markDirectBlocked();
         if (!healthyProxyCount()) markIpChallenged();
       }
+      return null;
+    }
+    // Same friendly wording on a DIRECT route = the server IP got the soft
+    // challenge — skip direct for a while so the proxy rounds take over.
+    if (!proxy && softChallenged) {
+      markDirectBlocked();
       return null;
     }
     // Proxy tunnel refused/dropped — the proxy cannot carry this traffic
@@ -826,7 +843,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // 512MB Render instance: 2 concurrent yt-dlp spawns peak ~300MB — 3 would
   // risk the OOM killer. Bigger hosts race 3.
   const RACE = ON_RENDER ? 2 : 3;
-  const PROXY_CAP = ON_RENDER ? 75_000 : 40_000; // slow proxy → fail to next fast
+  // Validated successes land at 28-40s on Render; a healthy-but-slow proxy
+  // that needs more than 50s is almost always doomed anyway. Failing fast
+  // to the next route is what turns the old 2-3 min walks into ~30s ones.
+  const PROXY_CAP = ON_RENDER ? 50_000 : 40_000;
   // Round recipes: cookieLESS default extraction is the VALIDATED recipe
   // through clean proxy IPs (cookies + datacenter-exit combos trigger the
   // "sign in to confirm" challenge; without cookies the same proxy returns
