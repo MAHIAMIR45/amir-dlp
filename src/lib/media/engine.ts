@@ -165,7 +165,7 @@ function parseProxyLines(text: string): string[] {
     .map((s) => (/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`)); // bare ip:port → http://
 }
 
-function loadProxies(): ProxySlot[] {
+export function loadProxies(): ProxySlot[] {
   const st = proxyState();
   const seedFile = path.join(process.cwd(), "python", "proxies.txt");
   const runtimeFile = runtimeProxyPoolPath();

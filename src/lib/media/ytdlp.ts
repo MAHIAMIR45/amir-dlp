@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   cliBaseArgs,
   ensureProxyPoolOnce,
+  loadProxies,
   getNextProxy,
   healthyProxyCount,
   isLocalProxy,
@@ -736,10 +737,11 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     // answers). Without cooling it down it stayed "healthy" and every later
     // batch re-picked it, burning 60-90s of the budget EACH time — the exact
     // "stuck for minutes with nothing happening" the API users reported.
-    // The LOCAL WARP tunnel gets a short cooldown: it is the dedicated exit,
-    // and a transient boot-time handshake delay must not bench it for long.
+    // The LOCAL WARP tunnel gets a SHORT cooldown: it is the dedicated exit
+    // and standalone retries through it succeed 3/3 — an in-walk challenge
+    // flake must simply be retried, not benched.
     if (proxy && /^extraction timed out/i.test(lastError)) {
-      markProxyDead(proxy, isLocalProxy(proxy) ? 180_000 : 600_000);
+      markProxyDead(proxy, isLocalProxy(proxy) ? 20_000 : 600_000);
       return null;
     }
 
@@ -765,7 +767,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     const softChallenged = /temporarily blocking this server|may be blocking this server/i.test(lastError);
     if (isIpChallenge(lastError) || (proxy && (isBotChallenge(lastError) || softChallenged))) {
       if (proxy) {
-        markProxyDead(proxy, isLocalProxy(proxy) ? 180_000 : 600_000); // 10 min (public) / 3 min (WARP)
+        // WARP: challenge flakes are transient (standalone retries pass) —
+        // 20s cooldown so the very next batch retries it. Public proxies:
+        // 10 min (their exits stay flagged).
+        markProxyDead(proxy, isLocalProxy(proxy) ? 20_000 : 600_000);
       } else {
         markDirectBlocked();
         if (!healthyProxyCount()) markIpChallenged();
@@ -904,6 +909,12 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     // fresh pool is ready before the current one fully dies.
     if (healthyProxyCount() < 4) refreshProxyPoolAsync();
     const batch: string[] = [];
+    // The local WARP tunnel is the PRIMARY exit: when healthy it ALWAYS
+    // gets a batch slot (round-robin would otherwise skip it for spans).
+    const warpSlot = loadProxies().find(
+      (s) => isLocalProxy(s.url) && s.deadUntil < Date.now()
+    );
+    if (warpSlot && ON_RENDER) batch.push(warpSlot.url);
     for (let i = 0; i < RACE; i++) {
       const p = getNextProxy();
       if (p && !batch.includes(p)) batch.push(p);
@@ -922,7 +933,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
         // (fastskip gets challenge-lite there even though it works from
         // other clean exits). Free proxies stay on the fast recipes.
         if (isLocalProxy(p)) {
-          return attempt(null, "full", p, PROXY_CAP);
+          // Full walk + a 90s cap: watch page + configs through the tunnel
+          // plus Render's slow spawns — verified 49 formats when allowed
+          // to finish (standalone runs succeed 3/3).
+          return attempt(null, "full", p, ON_RENDER ? 90_000 : PROXY_CAP);
         }
         return attempt(round.ck, round.walk, p, PROXY_CAP);
       })
