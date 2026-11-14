@@ -430,6 +430,7 @@ function spawnCliDownload(
     let buf = "";
     let timedOut = false;
     let settled = false;
+    let lastProgressAt = Date.now();
     let proc: ReturnType<typeof spawn>;
     try {
       proc = spawn(argv[0], argv.slice(1), {
@@ -458,6 +459,7 @@ function spawnCliDownload(
           const total = parseFloat(m[2]) * UNIT[m[3]];
           const downloaded = (total * parseFloat(m[1])) / 100;
           const speed = m[4] ? parseFloat(m[4]) * UNIT[m[5]] : undefined;
+          lastProgressAt = Date.now();
           onProgress(parseFloat(m[1]), total, downloaded, speed);
         }
       }
@@ -466,10 +468,14 @@ function spawnCliDownload(
       stderr += d.toString();
       if (stderr.length > 4000) stderr = stderr.slice(-4000);
     });
-    const timer = setTimeout(() => {
+    // STALL WATCHDOG: tunnels (WARP/socks) sometimes drop a flow mid-transfer
+    // and the socket just hangs — the user saw 62% forever. If NO progress
+    // line arrives for 45s, kill this attempt; the walk retries a fresh
+    // route/connection instead of spinning until the 10-minute job cap.
+    const kill = () => {
       timedOut = true;
       try {
-        if (proc.pid) process.kill(-proc.pid, "SIGKILL"); // negative pid = whole group
+        if (proc.pid) process.kill(-proc.pid, "SIGKILL");
       } catch {
         try {
           proc.kill("SIGKILL");
@@ -483,21 +489,26 @@ function spawnCliDownload(
       } catch {
         /* ignore */
       }
+    };
+    const stallTimer = setInterval(() => {
+      if (Date.now() - lastProgressAt > 45_000) kill();
+    }, 5_000);
+    const timer = setTimeout(() => {
+      kill();
     }, timeoutMs);
-    proc.on("error", (e) => {
-      clearTimeout(timer);
-      if (!settled) {
-        settled = true;
-        resolve({ code: 1, stderr: stderr || e.message, timedOut });
-      }
-    });
-    proc.on("close", (code) => {
+    const finish = (code: number | null) => {
+      clearInterval(stallTimer);
       clearTimeout(timer);
       if (!settled) {
         settled = true;
         resolve({ code: code ?? 1, stderr, timedOut });
       }
+    };
+    proc.on("error", (e) => {
+      stderr = stderr || e.message;
+      finish(1);
     });
+    proc.on("close", (code) => finish(code));
   });
 }
 
