@@ -1,14 +1,16 @@
 // Engine selection layer — the yt-dlp engine can run in two modes:
 //
 //  1. "python"  — spawn python3 + python/extract.py / download.py (the
-//     original setup; used on z.ai where a real python3 + venv exists).
+//     original setup; opt-in via YTDL_ENGINE=python where yt-dlp is
+//     importable, e.g. requirements.txt installed by a build pipeline).
 //  2. "cli"     — spawn the yt-dlp standalone binary (bin/yt-dlp, a
 //     self-contained yt-dlp build that needs NO python interpreter).
-//     Used on Vercel where no python3 exists in the Node runtime.
+//     DEFAULT whenever bin/yt-dlp exists (z.ai publish, Vercel, Render,
+//     local dev — the binary ships with the repo everywhere).
 //
 // BOTH modes are 100% yt-dlp + cookies — no third-party download APIs.
-// Selection: VERCEL=1 or RENDER=true → cli · YTDL_ENGINE=cli|python forces
-// a mode · otherwise (z.ai / local dev) → python.
+// Selection: bin/yt-dlp present → cli (default) · YTDL_ENGINE=cli|python
+// forces a mode · python mode is only for hosts with yt-dlp importable.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,9 +21,18 @@ export function useCliEngine(): boolean {
   const forced = (process.env.YTDL_ENGINE || "").toLowerCase();
   if (forced === "cli") return true;
   if (forced === "python") return false;
-  // Serverless / container hosts ship no python3 in the Node runtime →
-  // use the self-contained yt-dlp binary (Vercel, Render, etc.).
-  return process.env.VERCEL === "1" || process.env.RENDER === "true";
+  // Default: use the self-contained yt-dlp binary whenever it ships with
+  // the repo (bin/yt-dlp). It needs NO python interpreter and works on
+  // every host (z.ai publish, Render, Vercel, local dev). The vendored
+  // python fallback (python/_vendor) is no longer committed — it made the
+  // deploy payload ~63MB heavier for zero benefit. Python mode remains
+  // available explicitly via YTDL_ENGINE=python (requires yt-dlp via
+  // requirements.txt or PYTHONPATH on that host).
+  try {
+    return fs.existsSync(path.join(process.cwd(), "bin", "yt-dlp"));
+  } catch {
+    return process.env.VERCEL === "1" || process.env.RENDER === "true";
+  }
 }
 
 /**
