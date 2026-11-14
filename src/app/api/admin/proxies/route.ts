@@ -69,6 +69,40 @@ function checkProxy(proxy: string, timeoutSec: number): Promise<string | null> {
   });
 }
 
+/**
+ * Speed-check a connected proxy: pull a ~100KB YouTube-CDN image through it
+ * and report bytes/sec. Media downloads through the pool die on slow
+ * proxies (they crawl at <100KB/s and hit the attempt cap), so only keep
+ * proxies whose CDN throughput is usable.
+ */
+function speedProxy(proxy: string): Promise<number> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v: number) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    try {
+      const proc = spawn(
+        "curl",
+        ["-x", proxy, "--max-time", "15", "-o", "/dev/null", "-sS", "-w", "%{speed_download}", "https://i.ytimg.com/vi/jNQXAC9IVRw/maxresdefault.jpg"],
+        { stdio: ["ignore", "pipe", "pipe"], timeout: 19_000 }
+      );
+      let out = "";
+      proc.stdout!.on("data", (d) => (out += d.toString()));
+      proc.on("error", () => finish(0));
+      proc.on("close", () => {
+        const v = parseFloat(out.trim());
+        finish(Number.isFinite(v) ? v : 0);
+      });
+    } catch {
+      finish(0);
+    }
+  });
+}
+
 export async function GET() {
   return new Response(JSON.stringify(proxyPoolStatus(), null, 2), {
     status: 200,
