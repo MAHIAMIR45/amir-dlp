@@ -641,11 +641,22 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   const assigned = getNextCookie();
   const clients = [...FALLBACK_CLIENTS, null];
 
+  // Throw the FRIENDLY wording for YouTube-side blocks — the raw yt-dlp
+  // error (with its "please report this issue" boilerplate) confuses users.
+  const throwBlocked = (): never => {
+    if (isIpChallenge(lastError)) {
+      throw new Error(
+        "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again."
+      );
+    }
+    throw new Error(lastError);
+  };
+
   // R1: last-known-good cookie + internal client walk — warm path
   if (st_lastGood() && inBudget()) {
     const r = await attempt(st_lastGood(), CLIENT_WALK);
     if (r) return r;
-    if (blockedRecently()) throw new Error(lastError);
+    if (blockedRecently()) throwBlocked();
   }
 
   // R2: remaining healthy cookies sequentially (internal client walk)
@@ -655,7 +666,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     const r = await attempt(c.file, CLIENT_WALK);
     if (r) return r;
   }
-  if (blockedRecently()) throw new Error(lastError);
+  if (blockedRecently()) throwBlocked();
 
   // R3: mediaconnect without cookies (best single shot on clean IPs)
   if (inBudget() && !blockedRecently()) {
@@ -701,7 +712,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // Friendly user-facing messages for the common YouTube-side blocks.
   if (/failed to extract any player response/i.test(lastError)) {
     throw new Error(
-      "YouTube is temporarily blocking this server's extraction — please wait a minute and try again (a retry usually succeeds)"
+      "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again."
     );
   }
   throw new Error(lastError);
