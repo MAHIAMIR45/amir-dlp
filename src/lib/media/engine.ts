@@ -236,7 +236,13 @@ function ensureWarpTunnel(): void {
   const g = globalThis as unknown as { __warpTunnelSpawned?: boolean };
   if (g.__warpTunnelSpawned) return;
   g.__warpTunnelSpawned = true;
-  if (process.env.RENDER !== "true" && process.env.WARP_TUNNEL !== "1") return;
+  // Start the tunnel on EVERY long-lived host where the bundle ships —
+  // z.ai deploy, Render, local dev. Datacenter IPs (Alibaba FC, Render,
+  // sandbox) all get the same YouTube bot-challenge; the WARP consumer
+  // exit returns the FULL format list in seconds (verified: 37 formats /
+  // 1080p in 3.5s vs lite 360p-only direct). Vercel serverless has no
+  // long-lived process → skip. WARP_TUNNEL=0 = explicit opt-out.
+  if (process.env.VERCEL === "1" || process.env.WARP_TUNNEL === "0") return;
   try {
     const bin = path.join(process.cwd(), "bin", "warp", "wireproxy");
     const conf = path.join(process.cwd(), "bin", "warp", "wireproxy.conf");

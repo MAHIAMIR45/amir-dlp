@@ -352,6 +352,16 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
   audio_only.sort((a, b) => (b.abr || 0) - (a.abr || 0));
   if (!(combined.length || video_only.length || audio_only.length)) {
     const joined = r.stderr;
+    // TEMP DEBUG: capture the exact argv + stderr of empty-format runs so
+    // the app-vs-CLI discrepancy can be diagnosed (remove after fix).
+    try {
+      fs.appendFileSync(
+        "/tmp/appcli_debug.log",
+        `${new Date().toISOString()} ARGV=${argv.join(" ")}\nSTDERR_TAIL=${joined.slice(-1000)}\nSTDOUT_HEAD=${r.stdout.slice(0, 300)}\n\n`
+      );
+    } catch {
+      /* ignore */
+    }
     if (/HTTP Error 429|Too Many Requests/i.test(joined)) {
       return { ok: false, error: "YouTube is rate-limiting this server (HTTP 429) — please wait about a minute and try again" };
     }
@@ -712,7 +722,13 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   const attempt = async (cookiefile: string | null, client: string | null, proxy: string | null = null, capMs: number | null = null): Promise<YtInfo | null> => {
     const t0 = Date.now();
     const cap = capMs ?? (client === "mediaconnect" ? MEDIACONNECT_TIMEOUT : EXTRACT_TIMEOUT);
-    const t = Math.min(cap, remaining());
+    const rem = remaining();
+    // Budget exhausted → do NOT spawn. A negative cap once slipped through
+    // ("extraction timed out after -20s") and OVERWROTE the useful lastError
+    // with timeout noise, making the walk report total failure even when a
+    // degraded-but-usable result was already collected.
+    if (rem < 10_000) return null;
+    const t = Math.min(cap, rem);
     const out = (await runPython({ mode: "info", url, cookiefile, client, proxy }, t)) as unknown as YtInfo & { took?: number; js?: Record<string, boolean> };
     const secs = Math.round(((Date.now() - t0) / 1000) * 10) / 10;
     const src = `${cookiefile ? cookiefile.split("/").pop() || cookiefile : `client=${client || "default"}`}${proxy ? "@proxy" : ""}`;
@@ -766,9 +782,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     if (isIpChallenge(lastError) || (proxy && (isBotChallenge(lastError) || softChallenged))) {
       if (proxy) {
         // WARP: challenge flakes are transient (standalone retries pass) —
-        // 20s cooldown so the very next batch retries it. Public proxies:
-        // 10 min (their exits stay flagged).
-        markProxyDead(proxy, isLocalProxy(proxy) ? 20_000 : 600_000);
+        // 8s cooldown so the very next batch retries it (attempts cost only
+        // ~3.5s through the local tunnel). Public proxies: 10 min (their
+        // exits stay flagged).
+        markProxyDead(proxy, isLocalProxy(proxy) ? 8_000 : 600_000);
       } else {
         markDirectBlocked();
         if (!healthyProxyCount()) markIpChallenged();
@@ -822,6 +839,20 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     return false;
   };
 
+  // R0: WARP tunnel + last-good cookie — the FASTEST full-list path when
+  // the tunnel is up (verified: 37 formats / 1080p in ~3.5s, vs direct
+  // rounds that currently get the lite 360p-only serving first). Skipped
+  // when the tunnel is missing/cooling — direct rounds take over.
+  {
+    const warpReady = loadProxies().find(
+      (s) => isLocalProxy(s.url) && s.deadUntil < Date.now()
+    );
+    if (warpReady && inBudget()) {
+      const rw = await attempt(st_lastGood() || assigned, "full", warpReady.url, 40_000);
+      if (accept(rw)) return rw;
+    }
+  }
+
   // R1: last-known-good cookie + internal client walk — warm path.
   // Skipped while the server's own IP is known to be challenged (R3
   // proxies take over until the flag decays).
@@ -864,7 +895,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // pool build instead of failing with no routes. Bounded to 80s so the
   // walk still has budget to race the freshly validated proxies.
   if (!healthyProxyCount()) {
-    await ensureProxyPoolOnce(80_000);
+    // Bound the pool build by the REMAINING budget (the fixed 80s once ate
+    // the whole 60s walk budget by itself — the user waited 80s and still
+    // got nothing better than the already-collected degraded result).
+    await ensureProxyPoolOnce(Math.max(0, Math.min(80_000, remaining() - MIN_ATTEMPT_MS)));
   }
   // 512MB Render instance: 2 concurrent yt-dlp spawns peak ~300MB — 3 would
   // risk the OOM killer. Bigger hosts race 3.
@@ -900,8 +934,25 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     // a mid-walk rebuild is often the difference between success and a
     // dead spinner.
     if (healthyProxyCount() < 2) {
-      const built = await ensureProxyPoolOnce(70_000);
-      if (!built && !healthyProxyCount()) break; // nothing validated — stop
+      // The local WARP tunnel cooling down (8-20s challenge flake) is NOT
+      // the same as a drained pool: free-list refreshes are all dead and
+      // cannot replace a working tunnel — wait out the SHORT cooldown and
+      // retry WARP instead of burning the budget on a doomed pool build.
+      const now = Date.now();
+      const coolingWarp = loadProxies().find(
+        (s) => isLocalProxy(s.url) && s.deadUntil > now
+      );
+      const waitMs = coolingWarp
+        ? Math.min(coolingWarp.deadUntil - now + 250, remaining() - MIN_ATTEMPT_MS)
+        : 0;
+      if (waitMs > 0 && waitMs < 25_000) {
+        await new Promise((r) => setTimeout(r, Math.max(0, waitMs)));
+      } else {
+        const built = await ensureProxyPoolOnce(
+          Math.max(0, Math.min(70_000, remaining() - MIN_ATTEMPT_MS))
+        );
+        if (!built && !healthyProxyCount()) break; // nothing validated — stop
+      }
     }
     // Pool running low → refresh in the background (throttled 10 min) so a
     // fresh pool is ready before the current one fully dies.
@@ -912,7 +963,9 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     const warpSlot = loadProxies().find(
       (s) => isLocalProxy(s.url) && s.deadUntil < Date.now()
     );
-    if (warpSlot && ON_RENDER) batch.push(warpSlot.url);
+    // The local WARP tunnel is now the PRIMARY exit on EVERY long-lived
+    // host (z.ai deploy included) — a guaranteed batch slot when healthy.
+    if (warpSlot) batch.push(warpSlot.url);
     for (let i = 0; i < RACE; i++) {
       const p = getNextProxy();
       if (p && !batch.includes(p)) batch.push(p);
@@ -936,9 +989,14 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
           // pre-signed, no signature step) passes when YouTube briefly
           // challenges the FULL shape on the shared WARP egress.
           const warpWalk = walkIdx % 2 === 0 ? "full" : "ios,android,tv";
+          // RIDE THE COOKIE through the tunnel: WARP is a consumer-grade
+          // exit — cookies do NOT trigger the datacenter challenge here.
+          // Verified: WARP+cookies = 37 formats/1080p in 3.5s; WARP
+          // cookieless = "Sign in to confirm you're not a bot". The old
+          // cookieless recipe was written for datacenter proxy exits.
           // 90s cap: watch page + configs through the tunnel plus Render's
           // slow spawns — verified 49 formats when allowed to finish.
-          return attempt(null, warpWalk, p, ON_RENDER ? 90_000 : PROXY_CAP);
+          return attempt(proxyCookie, warpWalk, p, ON_RENDER ? 90_000 : PROXY_CAP);
         }
         return attempt(round.ck, round.walk, p, PROXY_CAP);
       })
