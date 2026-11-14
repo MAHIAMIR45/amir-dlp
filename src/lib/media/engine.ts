@@ -359,6 +359,19 @@ function ensureWarpTunnel(): void {
 // request already has it available (handshake needs ~2-5s).
 ensureWarpTunnel();
 
+// Cold-start pool warm: on hosts where the WARP tunnel cannot handshake
+// (blocked UDP egress) the first visitors would otherwise find an EMPTY
+// public-proxy pool and wait ~40s for a validated one to be built inline.
+// Start building it in the background right after boot so validated routes
+// are ready before real traffic arrives. Fire-and-forget, throttled.
+setTimeout(() => {
+  try {
+    refreshProxyPoolAsync();
+  } catch {
+    /* never break boot */
+  }
+}, 10_000).unref?.();
+
 function healthySlots(): ProxySlot[] {
   const now = Date.now();
   return loadProxies().filter((s) => s.deadUntil < now);

@@ -73,6 +73,36 @@ const _PY_CANDIDATES = ["/home/z/.venv/bin/python3", "python3", "/usr/bin/python
 let _pyPath: string | null = null;
 let _pyChecked = false;
 
+// ── WARP tunnel escalating cooldown ──────────────────────────────────
+// A hung WARP attempt must not burn the walk budget on EVERY request:
+// the first timeout benches the tunnel briefly, repeat failures escalate
+// (20s → 60s → 5min → 10min) so the walk falls back to the direct/cookie
+// route (verified ~6s) while the tunnel recovers. A successful WARP
+// extraction resets the ladder immediately.
+const _gWarp = globalThis as unknown as { __warpFailCount?: number; __ytLastGoodProxy?: string | null };
+
+function warpCooldownMs(): number {
+  const g = _gWarp;
+  g.__warpFailCount = (g.__warpFailCount || 0) + 1;
+  const ladder = [20_000, 60_000, 300_000, 600_000];
+  return ladder[Math.min((g.__warpFailCount || 1) - 1, ladder.length - 1)];
+}
+
+function warpCooldownReset(): void {
+  _gWarp.__warpFailCount = 0;
+}
+
+/** Remember which route (proxy URL, or null = direct) produced the last
+ *  success — the next walk tries the PROVEN route first instead of paying
+ *  a known-bad tunnel its full cap again. */
+function rememberRoute(proxy: string | null): void {
+  _gWarp.__ytLastGoodProxy = proxy;
+}
+
+function lastGoodProxy(): string | null {
+  return _gWarp.__ytLastGoodProxy ?? null;
+}
+
 /** Resolve the python3 interpreter (exported — shared by dljobs + version route). */
 export function resolvePython(): string {
   if (_pyChecked && _pyPath) return _pyPath;
@@ -547,9 +577,13 @@ function rateLimitedRecently(): boolean {
 const _gBlock = globalThis as unknown as {
   __ytIpChallengeUntil?: number;
   __ytDirectBlockedUntil?: number;
+  __ytDirectFailCount?: number;
 };
 const IP_CHALLENGE_COOLDOWN_MS = 300_000; // 5 min — challenges usually decay
-const DIRECT_BLOCKED_MS = 1_800_000; // 30 min — remember the direct IP is flagged (the challenge persists for hours, and every re-probe costs users ~50s)
+// Escalating direct-IP bench: a SINGLE challenged cookie on a CLEAN IP must
+// not hide the (fast, verified ~6s) direct route for half an hour — the
+// first failure benches direct 3 min, repeats escalate to 30 min. A direct
+// success resets the ladder (see markDirectGood).
 
 export function markIpChallenged(): void {
   _gBlock.__ytIpChallengeUntil = Date.now() + IP_CHALLENGE_COOLDOWN_MS;
@@ -559,8 +593,17 @@ export function ipChallengedRecently(): boolean {
   return (_gBlock.__ytIpChallengeUntil || 0) > Date.now();
 }
 
+const DIRECT_BLOCK_LADDER = [180_000, 600_000, 1_800_000]; // 3min → 10min → 30min
+
 export function markDirectBlocked(): void {
-  _gBlock.__ytDirectBlockedUntil = Date.now() + DIRECT_BLOCKED_MS;
+  const n = (_gBlock.__ytDirectFailCount || 0) + 1;
+  _gBlock.__ytDirectFailCount = n;
+  _gBlock.__ytDirectBlockedUntil = Date.now() + DIRECT_BLOCK_LADDER[Math.min(n - 1, DIRECT_BLOCK_LADDER.length - 1)];
+}
+
+/** A DIRECT attempt SUCCEEDED — the server IP is clean; forget past failures. */
+function markDirectGood(): void {
+  _gBlock.__ytDirectFailCount = 0;
 }
 
 export function directBlockedRecently(): boolean {
@@ -647,7 +690,7 @@ const MEDIACONNECT_TIMEOUT = Number(process.env.YTDL_MEDIACONNECT_TIMEOUT_MS || 
 // The z.ai publish gateway cuts idle requests at ~60-70s with the SAME
 // opaque HTML 502 — the non-Render budget stays safely under it.
 // Render web services allow very long requests (no lambda cap).
-const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || (ON_RENDER ? 210_000 : 45_000);
+const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || (ON_RENDER ? 210_000 : 50_000);
 // One yt-dlp invocation walks these clients INTERNALLY (comma list) and
 // stops at the first client that yields playable formats. On slow shared-CPU
 // hosts (Render free) every spawn costs ~10-20s, so a comma-list attempt is
@@ -727,7 +770,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // left in the budget the next spawn would just be killed mid-flight and the
   // user would see a confusing "extraction timed out after 8s" error. Skip
   // it instead — one meaningful attempt is worth more than a doomed one.
-  const MIN_ATTEMPT_MS = 30_000;
+  // 20s (not 30s): after a hung-tunnel failure the direct cookie round — the
+  // TYPICAL success costs only ~6s — must still be startable inside a 45s
+  // non-Render budget.
+  const MIN_ATTEMPT_MS = 20_000;
   const inBudget = () => EXTRACT_BUDGET - (Date.now() - budgetStart) >= MIN_ATTEMPT_MS;
   const remaining = () => EXTRACT_BUDGET - (Date.now() - budgetStart);
   let lastError = "extraction failed";
@@ -753,7 +799,12 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       tried.push({ src, ok: true, err: "", secs, js: out.js });
       writeExtractDebug(url, tried);
       if (cookiefile) markCookieGood(cookiefile);
-      if (proxy) markProxyGood(proxy);
+      if (proxy) {
+        markProxyGood(proxy);
+        if (isLocalProxy(proxy)) warpCooldownReset();
+      }
+      if (!proxy) markDirectGood();
+      rememberRoute(proxy || null);
       // Pin the route that produced this result so the download phase
       // (different request) walks the SAME proxy/cookie/client first —
       // re-extraction through a different route invalidates format ids.
@@ -768,11 +819,11 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     // answers). Without cooling it down it stayed "healthy" and every later
     // batch re-picked it, burning 60-90s of the budget EACH time — the exact
     // "stuck for minutes with nothing happening" the API users reported.
-    // The LOCAL WARP tunnel gets a SHORT cooldown: it is the dedicated exit
-    // and standalone retries through it succeed 3/3 — an in-walk challenge
-    // flake must simply be retried, not benched.
+    // The LOCAL WARP tunnel gets an ESCALATING cooldown (20s→60s→5min→10min):
+    // a fresh-boot handshake or a temporarily stale exit must not cost 30s
+    // on every request; a healthy WARP run resets the ladder.
     if (proxy && /^extraction timed out/i.test(lastError)) {
-      markProxyDead(proxy, isLocalProxy(proxy) ? 20_000 : 600_000);
+      markProxyDead(proxy, isLocalProxy(proxy) ? warpCooldownMs() : 600_000);
       return null;
     }
 
@@ -861,14 +912,27 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // R0: WARP tunnel + last-good cookie — the FASTEST full-list path when
   // the tunnel is up (verified: 37 formats / 1080p in ~3.5s, vs direct
   // rounds that currently get the lite 360p-only serving first). Skipped
-  // when the tunnel is missing/cooling — direct rounds take over.
+  // when the tunnel is missing/cooling — direct rounds take over. Runs
+  // FIRST only while the tunnel is the PROVEN route (fresh boot, or the
+  // last success rode the tunnel); a recent DIRECT success reorders the
+  // walk so the known-good ~6s cookie route is not queued behind a
+  // possibly-hung tunnel (R0b gives the tunnel its shot afterwards).
+  const _lastProxy = lastGoodProxy();
+  const warpPreferred = _lastProxy ? isLocalProxy(_lastProxy) : true;
   {
     const warpReady = loadProxies().find(
       (s) => isLocalProxy(s.url) && s.deadUntil < Date.now()
     );
-    if (warpReady && inBudget()) {
-      // 30s cap: a black-holed tunnel must not eat the whole 45s walk budget.
-      const rw = await attempt(st_lastGood() || assigned, "full", warpReady.url, 30_000);
+    if (warpReady && inBudget() && warpPreferred) {
+      // Tight cap: a healthy tunnel extracts in 3.5-8s; a hung one must not
+      // eat the budget — the walk needs MIN_ATTEMPT_MS left for the direct
+      // cookie rounds that follow.
+      const rw = await attempt(
+        st_lastGood() || assigned,
+        "full",
+        warpReady.url,
+        ON_RENDER ? 30_000 : 20_000
+      );
       if (accept(rw)) return rw;
     }
   }
@@ -886,6 +950,24 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     if (inBudget() && !blockedRecently()) {
       const rf = await attempt(st_lastGood(), "fullskip");
       if (accept(rf)) return rf;
+    }
+  }
+
+  // R0b: WARP second chance — when a DIRECT success made the walk prefer
+  // the cookie route and that route just failed, give the tunnel its shot
+  // before falling through to the public-proxy rounds.
+  {
+    const warpReady2 = loadProxies().find(
+      (s) => isLocalProxy(s.url) && s.deadUntil < Date.now()
+    );
+    if (warpReady2 && inBudget() && !warpPreferred) {
+      const rw2 = await attempt(
+        st_lastGood() || assigned,
+        "full",
+        warpReady2.url,
+        ON_RENDER ? 30_000 : 20_000
+      );
+      if (accept(rw2)) return rw2;
     }
   }
 
