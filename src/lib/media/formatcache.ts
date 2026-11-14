@@ -54,3 +54,17 @@ export function findFormat(url: string, formatId: string | null): { url: string 
   const hitFmt = all.find((f) => f.format_id === formatId && f.url);
   return hitFmt ? { url: hitFmt.url as string } : null;
 }
+
+/**
+ * The route (proxy/cookie/client-walk) that produced the cached listing.
+ * Download routes pin it FIRST so the format ids and googlevideo URLs
+ * (bound to the resolving route) stay valid.
+ */
+export function getPinnedRoute(url: string): {
+  proxy: string | null;
+  cookiefile: string | null;
+  client: string | null;
+} | null {
+  const info = getCachedInfo(url);
+  return info?.route || null;
+}

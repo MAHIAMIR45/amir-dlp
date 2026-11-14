@@ -7,6 +7,7 @@ import { NextRequest } from "next/server";
 import { runDownloadSync, startDlJob } from "@/lib/media/dljobs";
 import { progressPageHtml, jsonError, htmlErrorPage, serveTempFile } from "@/lib/media/streaming";
 import { useCliEngine, isServerlessHost } from "@/lib/media/engine";
+import { getPinnedRoute } from "@/lib/media/formatcache";
 import { trackRequest } from "@/lib/tracker";
 
 export const dynamic = "force-dynamic";
@@ -41,6 +42,11 @@ export async function GET(req: NextRequest) {
     `${title.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "video"}` +
     `${height ? ` ${height}p` : ""}.mp4`;
 
+  // Pin the route that produced the cached listing (proxy/cookie/walk) so
+  // the download re-extracts through the SAME path — format ids and
+  // googlevideo URLs stay valid on challenged server IPs.
+  const pinned = getPinnedRoute(url);
+
   const jobOpts = {
     mode: "mp4" as const,
     url,
@@ -50,6 +56,9 @@ export async function GET(req: NextRequest) {
     canCopy,
     filename: safeName,
     durationSec: dur && Number.isFinite(dur) ? dur : null,
+    proxy: pinned?.proxy ?? null,
+    cookiefile: pinned?.cookiefile ?? null,
+    clientWalk: pinned?.client ?? null,
   };
 
   try {

@@ -84,7 +84,8 @@ export async function GET(req: NextRequest) {
 
     // Video+Audio rows: every height (1080/720/480/360/…) paired with the
     // best audio — downloaded as one WhatsApp-safe MP4 via the job engine.
-    const sourceList = (info.video_only || []).length ? info.video_only : info.combined || [];
+    const sourceList: FormatEntry[] =
+      info.video_only && info.video_only.length ? info.video_only : info.combined || [];
     const vaRows = pickPerHeight(sourceList).map((f) => ({
       format_id: f.format_id,
       ext: "mp4",

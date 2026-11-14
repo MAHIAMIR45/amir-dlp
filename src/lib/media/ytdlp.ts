@@ -10,6 +10,7 @@ import {
   healthyProxyCount,
   markProxyDead,
   markProxyGood,
+  refreshProxyPoolAsync,
   useCliEngine,
   writableCookiePath,
   ytDlpCliPath,
@@ -57,6 +58,9 @@ export interface YtInfo {
   combined?: FormatEntry[];
   video_only?: FormatEntry[];
   audio_only?: FormatEntry[];
+  /** The route (proxy/cookie/client-walk) that produced this result —
+   *  the download engine pins it first so format ids stay valid. */
+  route?: { proxy: string | null; cookiefile: string | null; client: string | null };
 }
 
 const _PY_CANDIDATES = ["/home/z/.venv/bin/python3", "python3", "/usr/bin/python3"];
@@ -538,6 +542,30 @@ export async function ytSearch(q: string, limit = 12): Promise<{ results: Search
 }
 
 const FALLBACK_CLIENTS = ["tv", "web_safari", "android", "ios", "mweb", "web", "tv_embedded"];
+// Client-walk SUBSETS used when a route returns a DEGRADED format list
+// (challenge-lite: 1-2 combined itags, no DASH video-only). yt-dlp stops
+// at the first client that yields ANY playable formats — through flagged
+// IPs that is often a lite client (mweb/tv) with a crippled list — so the
+// retry must EXCLUDE the clients that already "succeeded" degraded.
+// ios/android tend to return the full adaptive list from datacenter IPs
+// and are fast, so they lead every subset.
+const PROXY_WALKS = ["ios,android,tv", "tv_simply,tv,web_safari", "android,ios,mweb", "web_safari,web,tv_embedded"];
+
+/**
+ * A challenge-lite player response: extraction "succeeded" but YouTube
+ * only served a tiny combined-format list (usually just 360p itag 18)
+ * with no DASH streams. A healthy response carries many video-only
+ * formats. Accept these as a LAST resort but keep walking for better.
+ */
+export function isDegradedInfo(info: YtInfo | null | undefined): boolean {
+  if (!info || !info.ok) return false;
+  const vo = info.video_only?.length || 0;
+  const ao = info.audio_only?.length || 0;
+  const co = info.combined?.length || 0;
+  if (vo >= 3) return false; // full adaptive list
+  if (ao >= 2 && co >= 1) return false; // reasonable audio + video
+  return vo + ao + co <= 3;
+}
 // Slow shared-CPU hosts (Render free) need bigger values — one yt-dlp spawn
 // costs 10-20s there and a 7-client walk needs 60-120s, so the fast-host
 // caps killed EVERY attempt mid-flight and the user just saw endless
@@ -608,12 +636,25 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     );
   }
   if (ipChallengedRecently()) {
+    // Pool empty as well? Kick a background refresh so the NEXT request has
+    // routes to try instead of the same dead state.
+    if (!healthyProxyCount()) refreshProxyPoolAsync();
     throw new Error(
       "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again."
     );
   }
 
   const budgetStart = Date.now();
+  // Best DEGRADED result seen so far — returned only if nothing better
+  // arrives within the budget (a 360p-only listing beats an error page).
+  let bestDegraded: YtInfo | null = null;
+  const keepDegraded = (r: YtInfo): void => {
+    const n = (r.video_only?.length || 0) + (r.audio_only?.length || 0) + (r.combined?.length || 0);
+    const prev = bestDegraded
+      ? (bestDegraded.video_only?.length || 0) + (bestDegraded.audio_only?.length || 0) + (bestDegraded.combined?.length || 0)
+      : -1;
+    if (n > prev) bestDegraded = r;
+  };
   // Never START an attempt that cannot finish: with less than MIN_ATTEMPT_MS
   // left in the budget the next spawn would just be killed mid-flight and the
   // user would see a confusing "extraction timed out after 8s" error. Skip
@@ -627,9 +668,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // (FC runtime has no readable stdout logs).
   const tried: { src: string; ok: boolean; err: string; secs: number; js?: Record<string, boolean> }[] = [];
 
-  const attempt = async (cookiefile: string | null, client: string | null, proxy: string | null = null): Promise<YtInfo | null> => {
+  const attempt = async (cookiefile: string | null, client: string | null, proxy: string | null = null, capMs: number | null = null): Promise<YtInfo | null> => {
     const t0 = Date.now();
-    const t = client === "mediaconnect" ? Math.min(MEDIACONNECT_TIMEOUT, remaining()) : Math.min(EXTRACT_TIMEOUT, remaining());
+    const cap = capMs ?? (client === "mediaconnect" ? MEDIACONNECT_TIMEOUT : EXTRACT_TIMEOUT);
+    const t = Math.min(cap, remaining());
     const out = (await runPython({ mode: "info", url, cookiefile, client, proxy }, t)) as unknown as YtInfo & { took?: number; js?: Record<string, boolean> };
     const secs = Math.round(((Date.now() - t0) / 1000) * 10) / 10;
     const src = `${cookiefile ? cookiefile.split("/").pop() || cookiefile : `client=${client || "default"}`}${proxy ? "@proxy" : ""}`;
@@ -638,6 +680,10 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       writeExtractDebug(url, tried);
       if (cookiefile) markCookieGood(cookiefile);
       if (proxy) markProxyGood(proxy);
+      // Pin the route that produced this result so the download phase
+      // (different request) walks the SAME proxy/cookie/client first —
+      // re-extraction through a different route invalidates format ids.
+      out.route = { proxy: proxy || null, cookiefile: cookiefile || null, client: client || null };
       return out;
     }
     lastError = out.error || lastError;
@@ -678,6 +724,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // Throw the FRIENDLY wording for YouTube-side blocks — the raw yt-dlp
   // error (with its "please report this issue" boilerplate) confuses users.
   const throwBlocked = (): never => {
+    if (!healthyProxyCount()) refreshProxyPoolAsync();
     if (isIpChallenge(lastError)) {
       throw new Error(
         "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again."
@@ -686,12 +733,23 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     throw new Error(lastError);
   };
 
+  // Full-quality result → accept and stop. Degraded (challenge-lite,
+  // 360p-only) result → remember it as a fallback and KEEP WALKING — a
+  // later route/client often returns the complete format list, and the
+  // user explicitly wants every quality, not just the first response.
+  const accept = (r: YtInfo | null): r is YtInfo => {
+    if (!r) return false;
+    if (!isDegradedInfo(r)) return true;
+    keepDegraded(r);
+    return false;
+  };
+
   // R1: last-known-good cookie + internal client walk — warm path.
   // Skipped while the server's own IP is known to be challenged (R3
   // proxies take over until the flag decays).
   if (!directBlockedRecently() && st_lastGood() && inBudget()) {
     const r = await attempt(st_lastGood(), CLIENT_WALK);
-    if (r) return r;
+    if (accept(r)) return r;
     if (blockedRecently()) throwBlocked();
   }
 
@@ -701,35 +759,52 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     for (const c of others) {
       if (!inBudget() || blockedRecently() || directBlockedRecently()) break;
       const r = await attempt(c.file, CLIENT_WALK);
-      if (r) return r;
+      if (accept(r)) return r;
     }
   }
   if (blockedRecently()) throwBlocked();
 
   // R3: PROXY rounds — the server IP is flagged (direct rounds refused or
-  // skipped): route the SAME cookie + client walk through each healthy
-  // proxy until one extracts. A proxy that fails is cooled down and the
-  // next one is tried; when the pool is exhausted the global fail-fast
-  // kicks in so users get an instant friendly message instead of minutes
-  // of futile spinning.
+  // skipped): route the SAME cookie through the proxy pool. PROXIES ARE
+  // RACED IN PARALLEL (challenge/429 enforcement is per EXIT-IP, so
+  // racing is safe) — this turns the old 2-4 minute sequential walk into
+  // roughly one attempt-length. Each batch rotates the player-client
+  // subset, so a proxy whose first walk returns a degraded challenge-lite
+  // list gets re-sampled with different clients next round. A proxy that
+  // hard-fails is cooled down; when the pool is exhausted a background
+  // refresh fetches a fresh pool for the next request.
   const proxyCookie = st_lastGood() || assigned;
+  // 512MB Render instance: 2 concurrent yt-dlp spawns peak ~300MB — 3 would
+  // risk the OOM killer. Bigger hosts race 3.
+  const RACE = ON_RENDER ? 2 : 3;
+  const PROXY_CAP = ON_RENDER ? 75_000 : 40_000; // slow proxy → fail to next fast
+  let walkIdx = 0;
   for (;;) {
     if (!inBudget() || rateLimitedRecently()) break;
-    const proxy = getNextProxy();
-    if (!proxy) break;
-    const r = await attempt(proxyCookie, CLIENT_WALK, proxy);
-    if (r) return r;
-    if (rateLimitedRecently()) throwBlocked();
-    if (!healthyProxyCount()) {
-      markIpChallenged();
-      throwBlocked();
+    // Pool running low → refresh in the background (throttled 10 min) so a
+    // fresh pool is ready before the current one fully dies.
+    if (healthyProxyCount() < 4) refreshProxyPoolAsync();
+    const batch: string[] = [];
+    for (let i = 0; i < RACE; i++) {
+      const p = getNextProxy();
+      if (p && !batch.includes(p)) batch.push(p);
     }
+    if (!batch.length) break;
+    const walk = PROXY_WALKS[walkIdx++ % PROXY_WALKS.length];
+    const results = await Promise.all(batch.map((p) => attempt(proxyCookie, walk, p, PROXY_CAP)));
+    const full = results.find((r) => r && !isDegradedInfo(r));
+    if (full) return full;
+    for (const r of results) {
+      if (r) keepDegraded(r);
+    }
+    if (rateLimitedRecently()) throwBlocked();
+    if (!healthyProxyCount()) break; // direct rounds continue while pool refreshes
   }
 
   // R4: mediaconnect without cookies (best single shot on clean IPs)
   if (!directBlockedRecently() && inBudget() && !blockedRecently()) {
     const r = await attempt(null, "mediaconnect");
-    if (r) return r;
+    if (accept(r)) return r;
   }
 
   // R5: player-client walk on the assigned cookie
@@ -737,7 +812,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     for (const client of clients) {
       if (!inBudget() || blockedRecently()) break;
       const r = await attempt(assigned, client);
-      if (r) return r;
+      if (accept(r)) return r;
     }
   }
 
@@ -749,7 +824,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       for (const client of ["tv", "web_safari", null]) {
         if (!inBudget() || blockedRecently()) break outer;
         const r = await attempt(c.file, client);
-        if (r) return r;
+        if (accept(r)) return r;
       }
     }
   }
@@ -759,7 +834,7 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     for (const client of clients) {
       if (!inBudget() || blockedRecently()) break;
       const r = await attempt(null, client);
-      if (r) return r;
+      if (accept(r)) return r;
     }
   }
 
@@ -767,6 +842,16 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   const totalSecs = Math.round(((Date.now() - budgetStart) / 1000) * 10) / 10;
   const summary = tried.map((t) => `${t.src}:${t.ok ? "OK" : "FAIL"} ${t.secs}s`).join(", ");
   console.log(`[extract] ALL failed for ${url} after ${totalSecs}s — ${lastError} [${summary}]`);
+  // A degraded (challenge-lite) listing is still a WORKING listing — the
+  // user gets its qualities rather than a dead spinner. The walk above
+  // already tried everything for a better list.
+  if (bestDegraded) {
+    const d = bestDegraded as YtInfo;
+    console.log(
+      `[extract] returning DEGRADED fallback: vo=${d.video_only?.length || 0} ao=${d.audio_only?.length || 0} co=${d.combined?.length || 0} (${totalSecs}s)`
+    );
+    return d;
+  }
   // Friendly user-facing messages for the common YouTube-side blocks.
   if (/failed to extract any player response/i.test(lastError)) {
     throw new Error(

@@ -7,6 +7,7 @@ import { NextRequest } from "next/server";
 import { runDownloadSync, startDlJob } from "@/lib/media/dljobs";
 import { progressPageHtml, jsonError, htmlErrorPage, serveTempFile } from "@/lib/media/streaming";
 import { useCliEngine, isServerlessHost } from "@/lib/media/engine";
+import { getPinnedRoute } from "@/lib/media/formatcache";
 import { trackRequest } from "@/lib/tracker";
 
 export const dynamic = "force-dynamic";
@@ -34,12 +35,19 @@ export async function GET(req: NextRequest) {
     `${title.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "song"}` +
     ` ${abr}kbps.mp3`;
 
+  // Pin the listing's route so the MP3 job re-extracts through the same
+  // path (proxy/cookie/walk) that resolved this video.
+  const pinned = getPinnedRoute(url);
+
   const jobOpts = {
     mode: "mp3" as const,
     url,
     audioFormatId: fmt,
     filename: safeName,
     durationSec: dur && Number.isFinite(dur) ? dur : null,
+    proxy: pinned?.proxy ?? null,
+    cookiefile: pinned?.cookiefile ?? null,
+    clientWalk: pinned?.client ?? null,
   };
 
   try {

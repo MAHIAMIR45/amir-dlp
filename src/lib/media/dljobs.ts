@@ -23,7 +23,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cliBaseArgs, getNextProxy, markProxyDead, markProxyGood, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
+import { cliBaseArgs, getNextProxy, healthyProxyCount, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
 import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
@@ -111,6 +111,14 @@ export interface StartDlJobOpts {
   filename: string;
   durationSec?: number | null;
   estBytes?: number | null;
+  // Pinned route from the listing extraction (YtInfo.route): the SAME
+  // proxy+cookie+client-walk that produced the format ids is tried FIRST
+  // during the download — googlevideo URLs and format ids are bound to
+  // the route that resolved them, and a different route often means
+  // "requested format not available" + minutes of futile walking.
+  proxy?: string | null;
+  cookiefile?: string | null;
+  clientWalk?: string | null;
 }
 
 /** Kick off a download job. Returns immediately; the job runs in background. */
@@ -195,7 +203,9 @@ function runYtDlpDownload(
     mode: opts.mode,
     url: opts.url,
     format,
-    cookiefile: getNextCookie(),
+    // Pinned cookie may be a /tmp copy that tmp-cleaners already deleted —
+    // validate before use, otherwise fall back to the rotation pool.
+    cookiefile: (opts.cookiefile && fs.existsSync(opts.cookiefile) ? opts.cookiefile : null) || getNextCookie(),
     out_base: path.join(os.tmpdir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
     concurrency: 4,
   };
@@ -502,15 +512,20 @@ async function runYtDlpDownloadCli(
   const span = pctTo - pctFrom;
   const deadline = Date.now() + JOB_TIMEOUT_MS;
 
-  const ck1 = firstCookie || getNextCookie();
+  const ck1 =
+    (firstCookie && fs.existsSync(firstCookie) ? firstCookie : null) ||
+    (opts.cookiefile && fs.existsSync(opts.cookiefile) ? opts.cookiefile : null) ||
+    getNextCookie();
   const ck2 = getNextCookie();
-  // Routes: the server's own IP first (unless it is known-challenged),
-  // then the proxy pool. Cookies ride along on every route.
-  const routes: (string | null)[] = directBlockedRecently() ? [] : [null];
+  // Routes: the LISTING's working route first (pinned), then the server's
+  // own IP (unless known-challenged), then the rest of the proxy pool.
+  const routes: (string | null)[] = [];
+  if (opts.proxy) routes.push(opts.proxy);
+  if (!directBlockedRecently() && !routes.includes(null)) routes.push(null);
   for (;;) {
     const p = getNextProxy();
-    if (!p) break;
-    if (!routes.includes(p)) routes.push(p);
+    if (!p || routes.includes(p)) break;
+    routes.push(p);
     if (routes.length >= 8) break; // cap per download job
   }
   const attempts: { ck: string | null; ca: string | null; proxy: string | null; label: string }[] = [];
@@ -518,6 +533,15 @@ async function runYtDlpDownloadCli(
     const tag = rt ? "@proxy" : "";
     if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients${tag}` });
     if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients${tag}` });
+  }
+  // Pinned walk first with the pinned cookie — format ids came from it.
+  if (opts.clientWalk && ck1 && attempts.length) {
+    attempts.unshift({
+      ck: ck1,
+      ca: opts.clientWalk,
+      proxy: opts.proxy || null,
+      label: `${path.basename(ck1)}+${opts.clientWalk.split(",")[0]}…${opts.proxy ? "@pinned-proxy" : "@direct"}`,
+    });
   }
   // No-cookie fallbacks stay direct-only (mediaconnect works on clean IPs)
   if (!directBlockedRecently()) {
@@ -591,6 +615,9 @@ async function runYtDlpDownloadCli(
     // A challenged cookie cools down so later requests start elsewhere
     if (at.ck && /sign in to confirm|not a bot/i.test(lastErr)) markCookieBlocked(at.ck, 120_000);
   }
+  // Every route failed — refresh the proxy pool in the background (throttled)
+  // so the user's retry hits a fresh pool instead of the same dead one.
+  if (!healthyProxyCount()) refreshProxyPoolAsync();
   return { ok: false, error: `yt-dlp download failed: ${friendlyDlError(lastErr || "no output file")}` };
 }
 
