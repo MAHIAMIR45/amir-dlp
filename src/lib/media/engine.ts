@@ -256,7 +256,15 @@ const _gRefresh = globalThis as unknown as {
 const PROXY_LIST_SOURCES = [
   "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
   "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+];
+
+/** Which scheme a fetched proxy line carries (socks lists hold bare ip:port too). */
+const SOCKS_SOURCES = [
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
 ];
 
 async function fetchTextTimeout(url: string, timeoutMs: number): Promise<string> {
@@ -439,18 +447,19 @@ export async function refreshProxyPool(): Promise<number> {
   const raw = new Set<string>();
   for (const u of PROXY_LIST_SOURCES) {
     const txt = await fetchTextTimeout(u, 20_000);
+    const scheme = SOCKS_SOURCES.includes(u) ? "socks5://" : "";
     txt
       .split(/[\n,]+/)
       .forEach((l) => {
         const s = l.trim();
-        if (/^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(s)) raw.add(s);
+        if (/^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(s)) raw.add(scheme + s);
       });
   }
-  const candidates = [...raw].sort(() => Math.random() - 0.5).slice(0, 260);
+  const candidates = [...raw].sort(() => Math.random() - 0.5).slice(0, 300);
   if (!candidates.length) return 0;
 
   const alive: string[] = [];
-  const flags = await runMap(candidates, 16, (c) => checkProxyAlive(`http://${c}`, 8));
+  const flags = await runMap(candidates, 16, (c) => checkProxyAlive(c, 8));
   candidates.forEach((c, i) => {
     if (flags[i]) alive.push(c);
   });
@@ -458,7 +467,7 @@ export async function refreshProxyPool(): Promise<number> {
 
   // THE filter: does this proxy's exit IP get a full player response?
   const probeN = Math.min(alive.length, 90);
-  const probes = await runMap(alive.slice(0, probeN), 20, (p) => probePlayerApi(`http://${p}`, 12));
+  const probes = await runMap(alive.slice(0, probeN), 20, (p) => probePlayerApi(p, 12));
   const clean = alive.slice(0, probeN).filter((_, i) => probes[i].verdict === "clean");
   if (!clean.length) return 0;
 
@@ -471,13 +480,13 @@ export async function refreshProxyPool(): Promise<number> {
   const mediaChecks = await runMap(
     probePairs,
     12,
-    (x) => checkMediaThroughProxy(`http://${x.p}`, x.mediaUrl as string, 14)
+    (x) => checkMediaThroughProxy(x.p, x.mediaUrl as string, 14)
   );
   const mediaOk = probePairs.filter((_, i) => (mediaChecks[i] || 0) > 0).map((x) => x.p);
   const finalList = mediaOk.length ? mediaOk : clean; // media-validated first; else keep probe-clean
 
   // Rank by CDN throughput (media must actually move).
-  const speeds = await runMap(finalList, 12, (p) => proxyThroughput(`http://${p}`));
+  const speeds = await runMap(finalList, 12, (p) => proxyThroughput(p));
   const ranked = finalList
     .map((p, i) => ({ p, v: speeds[i] || 0 }))
     .sort((a, b) => b.v - a.v);
@@ -515,6 +524,30 @@ export function refreshProxyPoolAsync(): void {
     .finally(() => {
       g.__proxyPoolRefreshBusy = false;
     });
+}
+
+// ── Awaitable pool build for walks that find an EMPTY pool ────────────
+// A boot-preset direct-block + dead seed leaves the first visitor with zero
+// routes; instead of failing fast, the walk awaits ONE fresh validated pool
+// (dedup'd across concurrent requests, bounded so the request budget holds).
+const _gEnsure = globalThis as unknown as { __proxyPoolEnsure?: Promise<number> };
+
+export function ensureProxyPoolOnce(maxWaitMs = 80_000): Promise<number> {
+  const g = _gEnsure;
+  if (!g.__proxyPoolEnsure) {
+    console.log("[proxies] pool empty — building a validated pool now");
+    g.__proxyPoolEnsure = refreshProxyPool().finally(() => {
+      // Allow a NEW ensure ~2 min later (pool decays fast on free lists).
+      setTimeout(() => {
+        g.__proxyPoolEnsure = undefined;
+      }, 120_000);
+    });
+  }
+  // Bound the wait: a walk must keep enough budget to actually use the pool.
+  return Promise.race([
+    g.__proxyPoolEnsure.catch(() => 0),
+    new Promise<number>((resolve) => setTimeout(() => resolve(0), maxWaitMs)),
+  ]);
 }
 
 /** Debug/admin snapshot — never exposes more than host:port of public pool. */

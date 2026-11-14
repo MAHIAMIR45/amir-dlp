@@ -620,6 +620,12 @@ async function runYtDlpDownloadCli(
     }
     lastErr = r.timedOut ? "attempt timed out" : r.stderr.trim() ? cliErrSummary(r.stderr) : `exit ${r.code}`;
     console.log(`[dl-walk ${i}] ${at.label} failed in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s: ${lastErr.slice(0, 120)}`);
+    // Timed-out proxy = black-holed tunnel — cool it so the walk moves to
+    // a usable exit instead of re-picking the same silent dead proxy.
+    if (r.timedOut && at.proxy) {
+      markProxyDead(at.proxy, 600_000);
+      continue;
+    }
     // 429 on THIS route: cool the offending exit IP only.
     if (isRateLimitError(lastErr)) {
       if (at.proxy) markProxyDead(at.proxy, 90_000);

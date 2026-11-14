@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   cliBaseArgs,
+  ensureProxyPoolOnce,
   getNextProxy,
   healthyProxyCount,
   markProxyDead,
@@ -726,6 +727,15 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     tried.push({ src, ok: false, err: (out.error || "").slice(0, 120), secs, js: out.js });
     console.log(`[extract] ${src} failed (${secs}s): ${lastError.slice(0, 100)}`);
 
+    // TIMED-OUT PROXY = black-holed tunnel (the proxy accepted TCP but never
+    // answers). Without cooling it down it stayed "healthy" and every later
+    // batch re-picked it, burning 60-90s of the budget EACH time — the exact
+    // "stuck for minutes with nothing happening" the API users reported.
+    if (proxy && /^extraction timed out/i.test(lastError)) {
+      markProxyDead(proxy, 600_000); // 10 min — re-probe later
+      return null;
+    }
+
     // 429 / throttle: blocks are per EXIT-IP.
     //  · direct → flag the server IP AND set the global 75s cooldown —
     //    remaining DIRECT rounds are skipped, but the proxy rounds still
@@ -840,14 +850,19 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // a fresh pool for the next request. Runs even when the DIRECT rounds
   // got 429'd/challenged — those blocks do not affect proxy exit IPs.
   const proxyCookie = st_lastGood() || assigned;
+  // EMPTY POOL (boot + dead seed, everything cooled): await ONE validated
+  // pool build instead of failing with no routes. Bounded to 80s so the
+  // walk still has budget to race the freshly validated proxies.
+  if (!healthyProxyCount()) {
+    await ensureProxyPoolOnce(80_000);
+  }
   // 512MB Render instance: 2 concurrent yt-dlp spawns peak ~300MB — 3 would
   // risk the OOM killer. Bigger hosts race 3.
   const RACE = ON_RENDER ? 2 : 3;
-  // Validated successes land at 28-40s on Render, but free proxies fluctuate
-  // minute-by-minute (a proxy clean at probe time can take 60-90s under
-  // load). 90s = generous enough to catch slow-but-working exits without
-  // burning the whole budget on a hopeless one.
-  const PROXY_CAP = ON_RENDER ? 90_000 : 40_000;
+  // 60s covers every validated success (28-40s) with headroom; a black-holed
+  // proxy then wastes only one 60s slot before its 10-min cooldown kicks in
+  // (see the timeout handling in attempt()).
+  const PROXY_CAP = ON_RENDER ? 60_000 : 40_000;
   // Round recipes: cookieLESS default extraction is the VALIDATED recipe
   // through clean proxy IPs (cookies + datacenter-exit combos trigger the
   // "sign in to confirm" challenge; without cookies the same proxy returns
