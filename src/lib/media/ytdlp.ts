@@ -14,7 +14,7 @@ import {
   markProxyDead,
   markProxyGood,
   refreshProxyPoolAsync,
-  useCliEngine,
+  isCliEngine,
   writableCookiePath,
   ytDlpCliPath,
 } from "./engine";
@@ -102,7 +102,7 @@ function scriptPath(): string {
 }
 
 function runPython(args: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
-  if (useCliEngine()) return runCliEngine(args, timeoutMs);
+  if (isCliEngine()) return runCliEngine(args, timeoutMs);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (v: Record<string, unknown>) => {
@@ -171,7 +171,6 @@ function humanSizeCli(size: unknown): string | null {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 function buildFormatEntryCli(fmt: any): FormatEntry {
   const vcodec = fmt.vcodec || "none";
   const acodec = fmt.acodec || "none";
@@ -203,7 +202,6 @@ function buildFormatEntryCli(fmt: any): FormatEntry {
     url: fmt.url ?? null,
   };
 }
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
 function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {

@@ -23,7 +23,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cliBaseArgs, getNextProxy, healthyProxyCount, isLocalProxy, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
+import { cliBaseArgs, getNextProxy, healthyProxyCount, isLocalProxy, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, isCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
 import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, isProxyConnError, isRateLimitError, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
@@ -216,9 +216,9 @@ function runYtDlpDownload(
   // while tv/web_safari etc. pass, so a single default-client spawn made
   // downloads fail at random. (The single-spawn path below stays for the
   // python engine on z.ai.)
-  if (useCliEngine()) return runYtDlpDownloadCli(job, opts, format, pctFrom, pctTo, args.cookiefile);
+  if (isCliEngine()) return runYtDlpDownloadCli(job, opts, format, pctFrom, pctTo, args.cookiefile);
 
-  const useCli = useCliEngine();
+  const useCli = isCliEngine();
   return new Promise((resolve) => {
     const outBase = args.out_base;
     const script = path.join(process.cwd(), "python", "download.py");

@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import path from "node:path";
 import { runHealthCheck } from "@/lib/tracker";
 import { resolvePython } from "@/lib/media/ytdlp";
-import { useCliEngine, ytDlpCliPath } from "@/lib/media/engine";
+import { isCliEngine, ytDlpCliPath } from "@/lib/media/engine";
 const execFileAsync = promisify(execFile);
 
 export const dynamic = "force-dynamic";
@@ -17,9 +17,9 @@ export async function GET(req: NextRequest) {
   if (!cachedVersion) {
     let ytdlpVer = "unknown";
     let pyVer = "unknown";
-    const engine = useCliEngine() ? "cli" : "python";
+    const engine = isCliEngine() ? "cli" : "python";
     try {
-      if (useCliEngine()) {
+      if (isCliEngine()) {
         // Vercel: standalone yt-dlp binary — no python interpreter involved.
         const { stdout } = await execFileAsync(ytDlpCliPath(), ["--version"], { timeout: 15000 });
         ytdlpVer = stdout.trim().split("\n")[0] || "unknown";
@@ -63,7 +63,7 @@ export async function GET(req: NextRequest) {
   }
   void runHealthCheck();
   return new Response(
-    JSON.stringify(cachedVersion || { version: "unknown", yt_dlp: "unknown", python: "unknown", framework: "nextjs-16", engine: useCliEngine() ? "cli" : "python" }),
+    JSON.stringify(cachedVersion || { version: "unknown", yt_dlp: "unknown", python: "unknown", framework: "nextjs-16", engine: isCliEngine() ? "cli" : "python" }),
     {
       status: 200,
       headers: { "Content-Type": "application/json" },

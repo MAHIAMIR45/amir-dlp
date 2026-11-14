@@ -6,7 +6,7 @@
 import { NextRequest } from "next/server";
 import { runDownloadSync, startDlJob } from "@/lib/media/dljobs";
 import { progressPageHtml, jsonError, htmlErrorPage, serveTempFile } from "@/lib/media/streaming";
-import { useCliEngine, isServerlessHost } from "@/lib/media/engine";
+import { isCliEngine, isServerlessHost } from "@/lib/media/engine";
 import { getPinnedRoute } from "@/lib/media/formatcache";
 import { trackRequest } from "@/lib/tracker";
 
@@ -51,7 +51,7 @@ export async function GET(req: NextRequest) {
   };
 
   try {
-    if (useCliEngine() && isServerlessHost()) {
+    if (isCliEngine() && isServerlessHost()) {
       // Serverless mode — one request, one file.
       const r = await runDownloadSync(jobOpts);
       if (!r.ok || !r.filePath || !r.size) {

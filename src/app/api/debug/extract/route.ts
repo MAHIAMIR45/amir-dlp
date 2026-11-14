@@ -17,7 +17,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { resolvePython, readExtractDebug, ipChallengedRecently } from "@/lib/media/ytdlp";
-import { cliBaseArgs, proxyPoolStatus, useCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
+import { cliBaseArgs, proxyPoolStatus, isCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -104,7 +104,7 @@ export async function GET(req: NextRequest) {
   const proxy = proxyParam && proxyParam !== "none" ? proxyParam : null;
 
   const envInfo = {
-    engine: useCliEngine() ? "cli" : "python",
+    engine: isCliEngine() ? "cli" : "python",
     python: resolvePython(),
     cwd: process.cwd(),
     cookies: cookies.map((c) => {
@@ -137,7 +137,7 @@ export async function GET(req: NextRequest) {
     ? await runCliOne(url, cookiePath, client, proxy, 110_000)
     : ipChallengedRecently()
     ? ({ ok: false, error: "skipped: server-IP challenge cooldown active (waiting it out)" } as Record<string, unknown>)
-    : useCliEngine()
+    : isCliEngine()
     ? await runCliOne(url, cookiePath, client, null, 40_000)
     : await runOne({ mode: "info", url, cookiefile: cookiePath, client }, 40_000);
 

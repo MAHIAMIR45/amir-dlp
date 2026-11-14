@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-export function useCliEngine(): boolean {
+export function isCliEngine(): boolean {
   const forced = (process.env.YTDL_ENGINE || "").toLowerCase();
   if (forced === "cli") return true;
   if (forced === "python") return false;
