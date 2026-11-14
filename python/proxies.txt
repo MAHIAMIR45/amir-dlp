@@ -1,22 +1,17 @@
-# Free public HTTP proxies — validated against real YouTube extraction
-# (yt-dlp returned formats through each one). They die fast; refresh anytime
-# via: curl -X POST https://amir-dlp.onrender.com/api/admin/proxies
-# Paid residential proxies are far more stable — set them via the
-# YTDL_PROXIES env var on the Render dashboard (comma separated).
-188.132.150.240:8080
-125.25.33.137:8080
-223.25.110.250:8088
-45.155.226.177:3128
-206.245.135.193:8888
-201.190.178.191:8080
-79.98.34.36:8080
-103.138.14.29:8080
-141.94.22.37:3128
-31.57.178.195:8080
-154.236.179.229:1976
-160.20.38.34:3125
-193.33.157.21:8080
-203.150.113.243:8080
-113.176.92.71:3128
-4.144.146.21:80
-202.125.155.121:8080
+# Validated YouTube proxy pool (HTTP/SOCKS5, full-format extraction checked)
+# Rebuild: python3 scripts/build_proxy_pool.py (z.ai) — full=extraction returned
+# the complete DASH list; degraded=only challenge-lite list (kept as last resort).
+http://103.21.150.15:3128
+http://103.237.102.191:11111
+http://41.196.16.228:1981
+http://213.131.85.28:1976
+http://102.244.78.61:8086
+http://38.196.221.146:999
+socks5://65.21.252.66:10808
+socks5://45.61.129.165:9050
+socks5://45.74.31.47:4063
+socks5://45.74.31.40:4254
+http://58.69.124.137:8080
+socks5://45.74.31.41:4252
+http://102.244.78.61:8081
+http://206.135.47.106:999

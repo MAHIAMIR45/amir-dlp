@@ -241,7 +241,9 @@ def _run_info_inner(url, cookiefile, client, logger):
     }
     if cookiefile:
         opts["cookiefile"] = cookiefile
-    if client:
+    # client == "full" means the DEFAULT extraction (no overrides) — the
+    # python engine already runs that, so there is nothing to set.
+    if client and client != "full":
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
 
     with yt_dlp.YoutubeDL(opts) as ydl:

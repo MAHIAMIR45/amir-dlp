@@ -286,16 +286,24 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
     "--socket-timeout",
     "25",
     "--no-playlist",
-    // Skip the watch-page + config roundtrips — goes straight to the player
-    // API. Cuts per-attempt time dramatically on slow shared-CPU hosts
-    // (Render free) where every spawn already costs 10-20s.
-    "--extractor-args",
-    "youtube:player_skip=webpage,configs",
-    "-J",
   ];
+  // "full" = completely default extraction (watch page + player configs +
+  // default client priority walk). Through CLEAN proxy IPs this is what
+  // returns the FULL format list — the fast player_skip walk below is
+  // served challenge-lite/degraded responses (1-2 itags) by YouTube even
+  // from clean IPs, while the default flow gets everything (47 formats
+  // verified through a validated proxy). Direct attempts on clean server
+  // IPs use the fast walk first (speed), then "full" as an upgrade shot.
+  if (client !== "full") {
+    argv.push(
+      "--extractor-args",
+      "youtube:player_skip=webpage,configs",
+    );
+  }
+  argv.push("-J");
   const ck = writableCookiePath(cookiefile);
   if (ck) argv.push("--cookies", ck);
-  if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
+  if (client && client !== "full") argv.push("--extractor-args", `youtube:player_client=${client}`);
   if (proxy) argv.push("--proxy", proxy);
   argv.push(url);
   const r = await spawnCli(argv, timeoutMs);
@@ -542,14 +550,14 @@ export async function ytSearch(q: string, limit = 12): Promise<{ results: Search
 }
 
 const FALLBACK_CLIENTS = ["tv", "web_safari", "android", "ios", "mweb", "web", "tv_embedded"];
-// Client-walk SUBSETS used when a route returns a DEGRADED format list
-// (challenge-lite: 1-2 combined itags, no DASH video-only). yt-dlp stops
-// at the first client that yields ANY playable formats — through flagged
-// IPs that is often a lite client (mweb/tv) with a crippled list — so the
-// retry must EXCLUDE the clients that already "succeeded" degraded.
-// ios/android tend to return the full adaptive list from datacenter IPs
-// and are fast, so they lead every subset.
-const PROXY_WALKS = ["ios,android,tv", "tv_simply,tv,web_safari", "android,ios,mweb", "web_safari,web,tv_embedded"];
+// Client-walk recipes for the PROXY_ROUNDS below. yt-dlp stops at the
+// first client that yields ANY playable formats — through flagged IPs that
+// is often a lite client (mweb/tv) with a crippled list — so the retry
+// must EXCLUDE the clients that already "succeeded" degraded.
+// "full" = default extraction (no extractor-args): through clean proxy IPs
+// it returns the complete format list (verified 47 formats/1080p) while
+// the fast player_skip walk gets degraded lists even from clean IPs.
+const PROXY_WALKS = ["full", "full", "ios,android,tv", "mweb,web"];
 
 /**
  * A challenge-lite player response: extraction "succeeded" but YouTube
@@ -605,7 +613,7 @@ function isBlockError(err: string): boolean {
   );
 }
 
-function isRateLimitError(err: string): boolean {
+export function isRateLimitError(err: string): boolean {
   return /429|too many requests|rate.limit/i.test(err);
 }
 
@@ -630,15 +638,19 @@ function isBotChallenge(err: string): boolean {
  * Bot challenge with cookie → 10 min cookie cooldown.
  */
 export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
-  if (rateLimitedRecently()) {
+  // Fail-fast flags only apply when there is NO alternative route: with
+  // healthy proxies available, a direct-IP 429/challenge must not stop the
+  // walk — those blocks are per-EXIT-IP and the proxies have other IPs.
+  const haveProxies = healthyProxyCount() > 0;
+  if (rateLimitedRecently() && !haveProxies) {
     throw new Error(
       "YouTube is rate-limiting this server (HTTP 429). Please wait about a minute and try again."
     );
   }
-  if (ipChallengedRecently()) {
+  if (ipChallengedRecently() && !haveProxies) {
     // Pool empty as well? Kick a background refresh so the NEXT request has
     // routes to try instead of the same dead state.
-    if (!healthyProxyCount()) refreshProxyPoolAsync();
+    refreshProxyPoolAsync();
     throw new Error(
       "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again."
     );
@@ -690,18 +702,23 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     tried.push({ src, ok: false, err: (out.error || "").slice(0, 120), secs, js: out.js });
     console.log(`[extract] ${src} failed (${secs}s): ${lastError.slice(0, 100)}`);
 
-    // 429: cool the whole pool down and stop retrying — more attempts
-    // right now only extend YouTube's throttle.
+    // 429 / throttle: blocks are per EXIT-IP.
+    //  · direct → flag the server IP AND set the global 75s cooldown —
+    //    remaining DIRECT rounds are skipped, but the proxy rounds still
+    //    run (their IPs are throttled independently).
+    //  · through a proxy → just cool THIS proxy down; the walk moves on.
     if (isRateLimitError(lastError)) {
-      markRateLimited();
+      if (proxy) {
+        markProxyDead(proxy, 90_000);
+      } else {
+        markRateLimited();
+        markDirectBlocked();
+      }
       return null;
     }
-    // Server-IP challenge (all player clients refused):
-    //  · through a proxy → THIS proxy's IP is also flagged — cool it down
-    //    and let the walk try the next proxy (do not stop the world).
-    //  · direct → remember the server IP is flagged; set the global
-    //    fail-fast ONLY when there are no proxies left to try.
-    if (isIpChallenge(lastError)) {
+    // Server-IP challenge (all player clients refused) and bot checks are
+    // also per EXIT-IP: cool the offending route, never the whole world.
+    if (isIpChallenge(lastError) || (proxy && isBotChallenge(lastError))) {
       if (proxy) {
         markProxyDead(proxy, 600_000); // 10 min
       } else {
@@ -750,7 +767,15 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   if (!directBlockedRecently() && st_lastGood() && inBudget()) {
     const r = await attempt(st_lastGood(), CLIENT_WALK);
     if (accept(r)) return r;
-    if (blockedRecently()) throwBlocked();
+    if (blockedRecently() && !haveProxies) throwBlocked();
+    // The fast walk returned only a challenge-lite list (or nothing) —
+    // one "full" (default extraction) upgrade shot before moving on: it
+    // fetches watch page + player configs, which is exactly what returns
+    // complete format lists.
+    if (inBudget() && !blockedRecently()) {
+      const rf = await attempt(st_lastGood(), "full");
+      if (accept(rf)) return rf;
+    }
   }
 
   // R2: remaining healthy cookies sequentially (internal client walk)
@@ -762,25 +787,39 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       if (accept(r)) return r;
     }
   }
-  if (blockedRecently()) throwBlocked();
+  if (blockedRecently() && !haveProxies) throwBlocked();
 
   // R3: PROXY rounds — the server IP is flagged (direct rounds refused or
   // skipped): route the SAME cookie through the proxy pool. PROXIES ARE
   // RACED IN PARALLEL (challenge/429 enforcement is per EXIT-IP, so
   // racing is safe) — this turns the old 2-4 minute sequential walk into
   // roughly one attempt-length. Each batch rotates the player-client
-  // subset, so a proxy whose first walk returns a degraded challenge-lite
-  // list gets re-sampled with different clients next round. A proxy that
-  // hard-fails is cooled down; when the pool is exhausted a background
-  // refresh fetches a fresh pool for the next request.
+  // subset ("full" = default extraction, the ONLY shape that returns the
+  // complete format list from clean IPs). A proxy that hard-fails is
+  // cooled down; when the pool is exhausted a background refresh fetches
+  // a fresh pool for the next request. Runs even when the DIRECT rounds
+  // got 429'd/challenged — those blocks do not affect proxy exit IPs.
   const proxyCookie = st_lastGood() || assigned;
   // 512MB Render instance: 2 concurrent yt-dlp spawns peak ~300MB — 3 would
   // risk the OOM killer. Bigger hosts race 3.
   const RACE = ON_RENDER ? 2 : 3;
   const PROXY_CAP = ON_RENDER ? 75_000 : 40_000; // slow proxy → fail to next fast
+  // Round recipes: cookieLESS default extraction is the VALIDATED recipe
+  // through clean proxy IPs (cookies + datacenter-exit combos trigger the
+  // "sign in to confirm" challenge; without cookies the same proxy returns
+  // the full 47-format list). Cookie batches ride along for age-gated
+  // videos, then alternate client walks as fallbacks.
+  const PROXY_ROUNDS: { walk: string; ck: string | null }[] = [
+    { walk: "full", ck: null },
+    { walk: "full", ck: proxyCookie },
+    { walk: "ios,android,tv", ck: null },
+    { walk: "mweb,web", ck: null },
+  ];
   let walkIdx = 0;
   for (;;) {
-    if (!inBudget() || rateLimitedRecently()) break;
+    // NOTE: rateLimitedRecently() intentionally NOT checked here — a 429 on
+    // the server's own IP has nothing to do with the proxies' exit IPs.
+    if (!inBudget()) break;
     // Pool running low → refresh in the background (throttled 10 min) so a
     // fresh pool is ready before the current one fully dies.
     if (healthyProxyCount() < 4) refreshProxyPoolAsync();
@@ -790,15 +829,14 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       if (p && !batch.includes(p)) batch.push(p);
     }
     if (!batch.length) break;
-    const walk = PROXY_WALKS[walkIdx++ % PROXY_WALKS.length];
-    const results = await Promise.all(batch.map((p) => attempt(proxyCookie, walk, p, PROXY_CAP)));
+    const round = PROXY_ROUNDS[walkIdx++ % PROXY_ROUNDS.length];
+    const results = await Promise.all(batch.map((p) => attempt(round.ck, round.walk, p, PROXY_CAP)));
     const full = results.find((r) => r && !isDegradedInfo(r));
     if (full) return full;
     for (const r of results) {
       if (r) keepDegraded(r);
     }
-    if (rateLimitedRecently()) throwBlocked();
-    if (!healthyProxyCount()) break; // direct rounds continue while pool refreshes
+    if (!healthyProxyCount()) break; // direct rounds / pool refresh take over
   }
 
   // R4: mediaconnect without cookies (best single shot on clean IPs)

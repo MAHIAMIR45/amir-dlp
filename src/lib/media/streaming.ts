@@ -6,6 +6,26 @@ import os from "node:os";
 import path from "node:path";
 import { USER_AGENT } from "./urls";
 
+/**
+ * Content-Disposition with a non-ASCII-safe filename: the plain `filename`
+ * parameter only allows ASCII (a Hindi/Arabic title would crash the header
+ * with "Cannot convert argument to a ByteString"), so the real name rides
+ * in the RFC 5987 `filename*` parameter.
+ */
+export function contentDisposition(filename: string): string {
+  const fallback =
+    filename
+      .replace(/[^\x20-\x7E]/g, "_")
+      .replace(/["\\/]/g, "_")
+      .replace(/\s+/g, " ")
+      .trim() || "download";
+  const encoded = encodeURIComponent(filename).replace(
+    /['()*]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+  );
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
 export function jsonError(message: string, status = 502): Response {
   return new Response(JSON.stringify({ status: "error", error: message }), {
     status,
@@ -151,7 +171,7 @@ export async function proxyMedia(
   }
 
   const outHeaders = new Headers({
-    "Content-Disposition": `attachment; filename="${filename}"`,
+    "Content-Disposition": contentDisposition(filename),
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
     "Content-Type": upstream.headers.get("Content-Type") || contentType,
@@ -459,7 +479,7 @@ export async function ffmpegStreamMerge(
     status: 200,
     headers: {
       "Content-Type": "video/mp4",
-      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Disposition": contentDisposition(filename),
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
       "X-Accel-Buffering": "no",
@@ -685,7 +705,7 @@ export function serveTempFile(filePath: string, size: number, contentType: strin
     headers: {
       "Content-Type": contentType,
       "Content-Length": String(size),
-      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Disposition": contentDisposition(filename),
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
     },

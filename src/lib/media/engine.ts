@@ -151,10 +151,17 @@ export function runtimeProxyPoolPath(): string {
 }
 
 function parseProxyLines(text: string): string[] {
-  return text
+  // Strip comments FIRST (a comment containing a comma would otherwise be
+  // split mid-line and the tail mistaken for a host:port), then keep only
+  // segments that really look like [scheme://]host:port.
+  const cleaned = text
+    .split("\n")
+    .map((l) => l.replace(/#.*$/, "").trim())
+    .join("\n");
+  return cleaned
     .split(/[\n,]+/)
     .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith("#"))
+    .filter((s) => /^[a-z][a-z0-9+.-]*:\/\/[^\s/:]+:\d{2,5}$/.test(s) || /^[^\s/:]+:\d{2,5}$/.test(s))
     .map((s) => (/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`)); // bare ip:port → http://
 }
 
@@ -178,15 +185,18 @@ function loadProxies(): ProxySlot[] {
   } catch {
     /* no seed file */
   }
-  // Runtime-maintained pool (admin refresh) takes precedence: read it LAST
-  // and if non-empty, use it INSTEAD of the seed (it is fresher).
+  // Runtime-maintained pool (admin refresh / background refresh) is the
+  // freshest source, but MERGE with the seed instead of overriding: the
+  // seed holds proxies validated by the full extraction pipeline, and
+  // dropping them because a stale /tmp file exists would leave only the
+  // runtime leftovers.
   let runtime: string[] = [];
   try {
     runtime = parseProxyLines(fs.readFileSync(runtimeFile, "utf-8"));
   } catch {
     /* no runtime pool yet */
   }
-  const final = runtime.length ? runtime : urls;
+  const final = runtime.length ? [...new Set([...runtime, ...urls])] : urls;
   st.mtimeKey = key;
   st.slots = [...new Set(final)].map((url) => ({ url, deadUntil: 0 }));
   st.idx = 0;
@@ -281,6 +291,71 @@ function checkProxyAlive(proxy: string, timeoutSec: number): Promise<boolean> {
   });
 }
 
+/**
+ * Innertube player-API probe: ONE small POST through the proxy tells us
+ * whether its exit IP gets a full player response (clean) or the bot
+ * challenge (challenged). This is the actual metric — CONNECT checks and
+ * CDN speed pass even for challenge-flagged IPs, and yt-dlp runs cost
+ * minutes on Render. Mirrors yt-dlp's ANDROID client (v 21.26.364).
+ */
+function probePlayerApi(proxy: string, timeoutSec: number): Promise<"clean" | "challenged" | "dead"> {
+  const body = JSON.stringify({
+    context: {
+      client: {
+        clientName: "ANDROID",
+        clientVersion: "21.26.364",
+        androidSdkVersion: 30,
+        hl: "en",
+        gl: "US",
+        osName: "Android",
+        osVersion: "11",
+      },
+    },
+    videoId: "jNQXAC9IVRw",
+    contentCheckOk: true,
+    racyCheckOk: true,
+  });
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn(
+        "curl",
+        [
+          "-x", proxy,
+          "--max-time", String(timeoutSec),
+          "-sS",
+          "-H", "User-Agent: com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
+          "-H", "Content-Type: application/json",
+          "-H", "X-YouTube-Client-Name: 3",
+          "-H", "X-YouTube-Client-Version: 21.26.364",
+          "-d", body,
+          "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"], timeout: (timeoutSec + 4) * 1000 }
+      );
+      let out = "";
+      proc.stdout!.on("data", (d) => (out += d.toString()));
+      proc.on("error", () => resolve("dead"));
+      proc.on("close", () => {
+        const i = out.indexOf("{");
+        if (i < 0) return resolve("dead");
+        try {
+          const d = JSON.parse(out.slice(i));
+          if (d.error) return resolve("dead");
+          const ps = d.playabilityStatus || {};
+          const sd = d.streamingData || {};
+          const fmts = (sd.formats || []).length + (sd.adaptiveFormats || []).length;
+          if (ps.status === "OK" && fmts > 0) return resolve("clean");
+          return resolve("challenged");
+        } catch {
+          return resolve("dead");
+        }
+      });
+    } catch {
+      resolve("dead");
+    }
+  });
+}
+
 /** CDN throughput probe — media downloads die on proxies slower than this. */
 function proxyThroughput(proxy: string): Promise<number> {
   return new Promise((resolve) => {
@@ -318,8 +393,10 @@ async function runMap<T, R>(items: T[], conc: number, fn: (item: T) => Promise<R
 }
 
 /**
- * Fetch + validate a fresh pool. Returns the number of healthy proxies
- * written (0 = sources unreachable / nothing validated).
+ * Fetch + validate a fresh pool. Pipeline: fetch lists → CONNECT prefilter
+ * → innertube player-API probe (the real challenge test) → probe-clean
+ * proxies ranked by CDN throughput → write runtime pool. Returns the
+ * number of healthy proxies written (0 = nothing validated).
  */
 export async function refreshProxyPool(): Promise<number> {
   const raw = new Set<string>();
@@ -332,7 +409,7 @@ export async function refreshProxyPool(): Promise<number> {
         if (/^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(s)) raw.add(s);
       });
   }
-  const candidates = [...raw].sort(() => Math.random() - 0.5).slice(0, 220);
+  const candidates = [...raw].sort(() => Math.random() - 0.5).slice(0, 260);
   if (!candidates.length) return 0;
 
   const alive: string[] = [];
@@ -342,14 +419,18 @@ export async function refreshProxyPool(): Promise<number> {
   });
   if (!alive.length) return 0;
 
-  // Throughput filter — keep proxies that can actually move media bytes.
-  const speeds = await runMap(alive.slice(0, 60), 16, (p) => proxyThroughput(`http://${p}`));
-  const ranked = alive
-    .slice(0, 60)
+  // THE filter: does this proxy's exit IP get a full player response?
+  const probeN = Math.min(alive.length, 90);
+  const verdicts = await runMap(alive.slice(0, probeN), 20, (p) => probePlayerApi(`http://${p}`, 12));
+  const clean = alive.slice(0, probeN).filter((_, i) => verdicts[i] === "clean");
+  if (!clean.length) return 0;
+
+  // Rank the clean ones by CDN throughput (media must actually move).
+  const speeds = await runMap(clean, 12, (p) => proxyThroughput(`http://${p}`));
+  const ranked = clean
     .map((p, i) => ({ p, v: speeds[i] || 0 }))
     .sort((a, b) => b.v - a.v);
-  const usable = ranked.filter((x) => x.v >= 60_000).slice(0, 28).map((x) => x.p);
-  const final = usable.length ? usable : ranked.slice(0, 12).map((x) => x.p);
+  const final = ranked.slice(0, 28).map((x) => x.p);
 
   // Persist to the runtime pool (app dir may be read-only on some hosts).
   const poolFile = runtimeProxyPoolPath();

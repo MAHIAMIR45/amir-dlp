@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import { NextRequest } from "next/server";
 import { getJob } from "@/lib/media/dljobs";
+import { contentDisposition } from "@/lib/media/streaming";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -38,13 +39,14 @@ function serveJobFile(filePath: string, size: number, contentType: string, filen
       nodeStream.destroy();
     },
   });
-  const safeName = filename.replace(/[\\/:*?"<>|]+/g, "_");
+  const safeName = filename;
   return new Response(webStream, {
     status: 200,
     headers: {
       "Content-Type": contentType,
       "Content-Length": String(size),
-      "Content-Disposition": `attachment; filename="${safeName}"`,
+      // RFC 5987: the raw Hindi/Arabic title crashes the ByteString header.
+      "Content-Disposition": contentDisposition(safeName),
       "Accept-Ranges": "bytes",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",

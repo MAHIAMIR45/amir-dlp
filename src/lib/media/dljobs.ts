@@ -24,7 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cliBaseArgs, getNextProxy, healthyProxyCount, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
-import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
+import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, isRateLimitError, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
   id: string;
@@ -512,9 +512,11 @@ async function runYtDlpDownloadCli(
   const span = pctTo - pctFrom;
   const deadline = Date.now() + JOB_TIMEOUT_MS;
 
+  const pinnedCk =
+    opts.cookiefile && fs.existsSync(opts.cookiefile) ? opts.cookiefile : null;
   const ck1 =
+    pinnedCk ||
     (firstCookie && fs.existsSync(firstCookie) ? firstCookie : null) ||
-    (opts.cookiefile && fs.existsSync(opts.cookiefile) ? opts.cookiefile : null) ||
     getNextCookie();
   const ck2 = getNextCookie();
   // Routes: the LISTING's working route first (pinned), then the server's
@@ -530,18 +532,28 @@ async function runYtDlpDownloadCli(
   }
   const attempts: { ck: string | null; ca: string | null; proxy: string | null; label: string }[] = [];
   for (const rt of routes) {
-    const tag = rt ? "@proxy" : "";
-    if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients${tag}` });
-    if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients${tag}` });
-  }
-  // Pinned walk first with the pinned cookie — format ids came from it.
-  if (opts.clientWalk && ck1 && attempts.length) {
-    attempts.unshift({
-      ck: ck1,
-      ca: opts.clientWalk,
-      proxy: opts.proxy || null,
-      label: `${path.basename(ck1)}+${opts.clientWalk.split(",")[0]}…${opts.proxy ? "@pinned-proxy" : "@direct"}`,
-    });
+    // Proxy routes: cookieLESS attempts come first — cookie + datacenter-exit
+    // combos trigger YouTube's "sign in to confirm" challenge, while the
+    // same proxy cookieless returns the full list (validated recipe).
+    if (rt) {
+      if (rt === opts.proxy && opts.clientWalk) {
+        // Exact listing route first (same walk + same cookie state),
+        // then the cookieless variant of that walk.
+        attempts.push({
+          ck: pinnedCk,
+          ca: opts.clientWalk,
+          proxy: rt,
+          label: `${pinnedCk ? path.basename(pinnedCk) : "no-cookie"}+${opts.clientWalk.split(",")[0]}…@pinned-proxy`,
+        });
+        if (pinnedCk) attempts.push({ ck: null, ca: opts.clientWalk, proxy: rt, label: `no-cookie+${opts.clientWalk.split(",")[0]}…@pinned-proxy` });
+      }
+      attempts.push({ ck: null, ca: DL_CLIENT_WALK, proxy: rt, label: "no-cookie+clients@proxy" });
+      if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients@proxy` });
+      if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients@proxy` });
+    } else {
+      if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients` });
+      if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients` });
+    }
   }
   // No-cookie fallbacks stay direct-only (mediaconnect works on clean IPs)
   if (!directBlockedRecently()) {
@@ -559,8 +571,10 @@ async function runYtDlpDownloadCli(
     // Direct IP flagged mid-walk (a direct attempt just got refused):
     // skip the remaining DIRECT attempts — proxy routes still continue.
     if (!at.proxy && directBlockedRecently()) continue;
-    // 429 during the walk: stop — more attempts only extend the throttle
-    if (i > 0 && /429|too many requests/i.test(lastErr)) break;
+    // A 429 on a PREVIOUS attempt must not kill the whole walk: those are
+    // per EXIT-IP. Direct 429 → skip the rest of the direct attempts;
+    // proxy 429 → that proxy cools down and the next route continues.
+    if (i > 0 && isRateLimitError(lastErr) && !at.proxy) continue;
 
     const myBase = path.join(os.tmpdir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.a${i}`);
     const argv = [
@@ -582,7 +596,10 @@ async function runYtDlpDownloadCli(
     ];
     const ck = at.ck ? writableCookiePath(at.ck) : null;
     if (ck) argv.push("--cookies", ck);
-    if (at.ca) argv.push("--extractor-args", `youtube:player_client=${at.ca}`);
+    // "full" = default extraction (no player_client override) — needed when
+    // the pinned listing route used the full-default flow (clean proxies
+    // serve full format lists only to that request shape).
+    if (at.ca && at.ca !== "full") argv.push("--extractor-args", `youtube:player_client=${at.ca}`);
     if (at.proxy) argv.push("--proxy", at.proxy);
     argv.push("-f", format, "-o", `${myBase}.%(ext)s`, opts.url);
 
@@ -599,12 +616,18 @@ async function runYtDlpDownloadCli(
     }
     lastErr = r.timedOut ? "attempt timed out" : r.stderr.trim() ? cliErrSummary(r.stderr) : `exit ${r.code}`;
     console.log(`[dl-walk ${i}] ${at.label} failed in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s: ${lastErr.slice(0, 120)}`);
+    // 429 on THIS route: cool the offending exit IP only.
+    if (isRateLimitError(lastErr)) {
+      if (at.proxy) markProxyDead(at.proxy, 90_000);
+      else markDirectBlocked();
+      continue;
+    }
     // All player clients refused:
     //  · via proxy → this proxy's IP is flagged too — cool it down, try
     //    the next route (downloads just keep walking the pool).
     //  · direct → remember the server IP is flagged; remaining DIRECT
     //    attempts are skipped, proxy routes continue.
-    if (isIpChallenge(lastErr)) {
+    if (isIpChallenge(lastErr) || (at.proxy && /sign in to confirm|not a bot/i.test(lastErr))) {
       if (at.proxy) {
         markProxyDead(at.proxy, 600_000); // 10 min
       } else {
