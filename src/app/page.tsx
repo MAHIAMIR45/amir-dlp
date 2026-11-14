@@ -97,6 +97,17 @@ async function fetchJSON<T>(path: string, timeout = API_TIMEOUT): Promise<T> {
   const t = setTimeout(() => ctl.abort(), timeout);
   try {
     const res = await fetch(path, { signal: ctl.signal });
+    const ct = res.headers.get("content-type") || "";
+    // A gateway 502/504 (or any server error page) returns HTML — parsing
+    // that as JSON produced the cryptic "Unexpected token '<'" toast. Give
+    // the user a readable message instead.
+    if (!ct.includes("json")) {
+      throw new Error(
+        res.status >= 500
+          ? "Server temporarily busy — please try again in a few seconds."
+          : "Unexpected server response — please try again."
+      );
+    }
     return (await res.json()) as T;
   } finally {
     clearTimeout(t);

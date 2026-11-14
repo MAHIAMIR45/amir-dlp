@@ -15,7 +15,10 @@ import {
   markProxyGood,
   refreshProxyPoolAsync,
   isCliEngine,
+  pyiTempBroken,
+  sweepPyiTemp,
   writableCookiePath,
+  ytdlpSpawnEnv,
   ytDlpCliPath,
 } from "./engine";
 
@@ -114,7 +117,7 @@ function runPython(args: Record<string, unknown>, timeoutMs: number): Promise<Re
     try {
       const proc = spawn(resolvePython(), [scriptPath(), JSON.stringify(args)], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+        env: ytdlpSpawnEnv(),
       });
       let out = "";
       proc.stdout.on("data", (d) => (out += d.toString()));
@@ -203,7 +206,19 @@ function buildFormatEntryCli(fmt: any): FormatEntry {
   };
 }
 
-function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+async function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  let r = await spawnCliOnce(argv, timeoutMs);
+  // PyInstaller temp-dir failure (full /tmp or unwritable TMPDIR): sweep the
+  // stale _MEI* unpack dirs and retry ONCE — self-heals hosts whose tmpfs
+  // filled up, instead of failing every request until a redeploy.
+  if (pyiTempBroken(r.stderr) || pyiTempBroken(r.stdout)) {
+    sweepPyiTemp(true);
+    r = await spawnCliOnce(argv, timeoutMs);
+  }
+  return r;
+}
+
+function spawnCliOnce(argv: string[], timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -213,7 +228,7 @@ function spawnCli(argv: string[], timeoutMs: number): Promise<{ code: number; st
     try {
       proc = spawn(argv[0], argv.slice(1), {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+        env: ytdlpSpawnEnv(),
         // Own process group so a timeout can kill yt-dlp AND its JS-runtime
         // children (node/bun). Without this a lingering child holds the stdio
         // pipes open and delays 'close' by ~10s after every timed-out attempt
@@ -629,8 +644,10 @@ const MEDIACONNECT_TIMEOUT = Number(process.env.YTDL_MEDIACONNECT_TIMEOUT_MS || 
 // Total walk budget: worst case = budget + one overrunning attempt.
 // On Vercel this MUST stay under the function limit — a request that
 // outlives it returns an opaque HTML 502 and the phone spins forever.
+// The z.ai publish gateway cuts idle requests at ~60-70s with the SAME
+// opaque HTML 502 — the non-Render budget stays safely under it.
 // Render web services allow very long requests (no lambda cap).
-const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || (ON_RENDER ? 210_000 : 60_000);
+const EXTRACT_BUDGET = Number(process.env.YTDL_EXTRACT_BUDGET_MS || "") || (ON_RENDER ? 210_000 : 45_000);
 // One yt-dlp invocation walks these clients INTERNALLY (comma list) and
 // stops at the first client that yields playable formats. On slow shared-CPU
 // hosts (Render free) every spawn costs ~10-20s, so a comma-list attempt is
@@ -800,9 +817,11 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     }
     // Proxy tunnel refused/dropped — the proxy cannot carry this traffic
     // (some allow the player API but 403 googlevideo CONNECTs). Cool it so
-    // later walks skip straight to usable proxies.
+    // later walks skip straight to usable proxies. The LOCAL WARP tunnel
+    // gets a SHORT cooldown: "not bound yet" right after boot (2-5s
+    // handshake) must be retried in seconds, not bench it for 10 minutes.
     if (proxy && isProxyConnError(lastError)) {
-      markProxyDead(proxy, 600_000);
+      markProxyDead(proxy, isLocalProxy(proxy) ? 20_000 : 600_000);
       return null;
     }
     if (cookiefile) {
@@ -848,7 +867,8 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       (s) => isLocalProxy(s.url) && s.deadUntil < Date.now()
     );
     if (warpReady && inBudget()) {
-      const rw = await attempt(st_lastGood() || assigned, "full", warpReady.url, 40_000);
+      // 30s cap: a black-holed tunnel must not eat the whole 45s walk budget.
+      const rw = await attempt(st_lastGood() || assigned, "full", warpReady.url, 30_000);
       if (accept(rw)) return rw;
     }
   }

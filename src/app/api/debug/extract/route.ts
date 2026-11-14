@@ -17,7 +17,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { resolvePython, readExtractDebug, ipChallengedRecently } from "@/lib/media/ytdlp";
-import { cliBaseArgs, proxyPoolStatus, isCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
+import { cliBaseArgs, proxyPoolStatus, isCliEngine, writableCookiePath, ytdlpSpawnEnv, ytDlpCliPath } from "@/lib/media/engine";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -50,7 +50,7 @@ function runOne(args: Record<string, unknown>, timeoutMs: number): Promise<Recor
       const script = path.join(process.cwd(), "python", "extract.py");
       const proc = spawn(resolvePython(), [script, JSON.stringify(args)], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PATH: process.env.PATH || "/usr/bin:/bin" },
+        env: ytdlpSpawnEnv(),
       });
       let out = "";
       proc.stdout.on("data", (d) => (out += d.toString()));
@@ -179,7 +179,7 @@ async function runCliOne(
       argv.push(url);
       const proc = spawn(argv[0], argv.slice(1), {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+        env: ytdlpSpawnEnv(),
       });
       let out = "";
       let err = "";

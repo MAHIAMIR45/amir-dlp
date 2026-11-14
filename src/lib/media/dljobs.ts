@@ -21,9 +21,8 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { cliBaseArgs, getNextProxy, healthyProxyCount, isLocalProxy, markProxyDead, markProxyGood, refreshProxyPoolAsync, resolveFfmpegBin, isCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
+import { cliBaseArgs, getNextProxy, healthyProxyCount, isLocalProxy, markProxyDead, markProxyGood, pyiTempBroken, refreshProxyPoolAsync, resolveFfmpegBin, isCliEngine, sweepPyiTemp, writableCookiePath, ytdlpSpawnEnv, ytdlpTmpDir, ytDlpCliPath } from "./engine";
 import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, isProxyConnError, isRateLimitError, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
@@ -206,7 +205,7 @@ function runYtDlpDownload(
     // Pinned cookie may be a /tmp copy that tmp-cleaners already deleted —
     // validate before use, otherwise fall back to the rotation pool.
     cookiefile: (opts.cookiefile && fs.existsSync(opts.cookiefile) ? opts.cookiefile : null) || getNextCookie(),
-    out_base: path.join(os.tmpdir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
+    out_base: path.join(ytdlpTmpDir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
     concurrency: 4,
   };
 
@@ -223,8 +222,8 @@ function runYtDlpDownload(
     const outBase = args.out_base;
     const script = path.join(process.cwd(), "python", "download.py");
     const spawnOpts = {
-      stdio: ["ignore", "pipe", "pipe"] as const,
-      env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+      stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin", TMPDIR: ytdlpTmpDir() },
     };
     const proc = useCli
       ? spawn(
@@ -435,7 +434,7 @@ function spawnCliDownload(
     try {
       proc = spawn(argv[0], argv.slice(1), {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+        env: ytdlpSpawnEnv(),
         // Own process group: on timeout kill yt-dlp AND its JS-runtime children
         // (node/bun) — a lingering child otherwise holds the stdio pipes open
         // and delays 'close' after every timed-out attempt.
@@ -595,7 +594,7 @@ async function runYtDlpDownloadCli(
     // proxy 429 → that proxy cools down and the next route continues.
     if (i > 0 && isRateLimitError(lastErr) && !at.proxy) continue;
 
-    const myBase = path.join(os.tmpdir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.a${i}`);
+    const myBase = path.join(ytdlpTmpDir(), `ytdl_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.a${i}`);
     const argv = [
       ytDlpCliPath(),
       ...cliBaseArgs(),
@@ -630,9 +629,17 @@ async function runYtDlpDownloadCli(
     argv.push("-f", format, "-o", `${myBase}.%(ext)s`, opts.url);
 
     const t0 = Date.now();
-    const r = await spawnCliDownload(argv, Math.min(remaining, 180_000), (pct, _total, downloaded, speed) => {
+    let r = await spawnCliDownload(argv, Math.min(remaining, 180_000), (pct, _total, downloaded, speed) => {
       setPhase(job, pctFrom + (pct / 100) * span, downloaded, speed);
     });
+    // PyInstaller temp-dir failure (full /tmp): sweep stale unpack dirs and
+    // retry THIS attempt once — the walk must not die on a healable error.
+    if (pyiTempBroken(r.stderr)) {
+      sweepPyiTemp(true);
+      r = await spawnCliDownload(argv, Math.min(remaining, 180_000), (pct, _total, downloaded, speed) => {
+        setPhase(job, pctFrom + (pct / 100) * span, downloaded, speed);
+      });
+    }
     const done = pickFinalFile(myBase);
     if (done) {
       if (at.ck) markCookieGood(at.ck);
@@ -691,7 +698,7 @@ async function runYtDlpDownloadCli(
 // ── local ffmpeg post-processing ──────────────────────────────────────
 
 function tmpOut(suffix: string): string {
-  return path.join(os.tmpdir(), `job_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${suffix}`);
+  return path.join(ytdlpTmpDir(), `job_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${suffix}`);
 }
 
 /** Fast WhatsApp-safe faststart remux of an already H.264/AAC mp4. */

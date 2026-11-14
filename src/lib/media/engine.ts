@@ -125,6 +125,95 @@ export function writableCookiePath(cookiefile: string | null | undefined): strin
   }
 }
 
+// ── yt-dlp temp-dir hygiene (PyInstaller unpack management) ───────────
+// The standalone yt-dlp binary is a PyInstaller bundle: EVERY spawn
+// unpacks itself into $TMPDIR/_MEIxxxxxx (~40-80MB). On hosts whose /tmp
+// is a small tmpfs (z.ai publish container) those folders pile up until
+// mkdir fails and EVERY run dies instantly:
+//   [PYI-1234:ERROR] Could not create temporary directory!
+// Two-part fix:
+//   1. Point TMPDIR at a dedicated dir on the app's MAIN disk
+//      (<cwd>/.ytdlp-tmp) instead of the (often tiny) /tmp tmpfs.
+//   2. Sweep stale _MEI* dirs before spawns (throttled) so a crashed run
+//      can never accumulate into a full disk again.
+const _gTmp = globalThis as unknown as {
+  __ytdlpTmpDir?: string;
+  __pyiSweepAt?: number;
+};
+
+/** Writable dir for yt-dlp unpacks — main disk preferred over /tmp. */
+export function ytdlpTmpDir(): string {
+  const cached = _gTmp.__ytdlpTmpDir;
+  if (cached) return cached;
+  try {
+    const dir = path.join(process.cwd(), ".ytdlp-tmp");
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.probe_${process.pid}`);
+    fs.writeFileSync(probe, "x");
+    fs.unlinkSync(probe);
+    _gTmp.__ytdlpTmpDir = dir;
+    return dir;
+  } catch {
+    /* read-only app dir → fall back to system tmp */
+  }
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ytdlp-"));
+    _gTmp.__ytdlpTmpDir = dir;
+    return dir;
+  } catch {
+    return os.tmpdir();
+  }
+}
+
+/** Delete stale PyInstaller _MEI* unpack dirs (older than 10 min). */
+export function sweepPyiTemp(force = false): void {
+  const now = Date.now();
+  if (!force && _gTmp.__pyiSweepAt && now - _gTmp.__pyiSweepAt < 60_000) return;
+  _gTmp.__pyiSweepAt = now;
+  const bases = new Set<string>([os.tmpdir()]);
+  try {
+    bases.add(ytdlpTmpDir());
+  } catch {
+    /* ignore */
+  }
+  for (const base of bases) {
+    let names: string[] = [];
+    try {
+      names = fs.readdirSync(base);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!/^_MEI\d+/.test(name)) continue;
+      try {
+        const full = path.join(base, name);
+        const st = fs.statSync(full);
+        // 10 min age guard: a LIVE extraction (max ~3.5 min) is never swept.
+        if (now - st.mtimeMs > 10 * 60_000) fs.rmSync(full, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/** Spawn env for yt-dlp children: TMPDIR on the main disk + sweep + PATH. */
+export function ytdlpSpawnEnv(): typeof process.env {
+  sweepPyiTemp();
+  const env = { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" };
+  try {
+    (env as Record<string, string | undefined>).TMPDIR = ytdlpTmpDir();
+  } catch {
+    /* keep the system default */
+  }
+  return env;
+}
+
+/** True when a spawn died on the PyInstaller temp-dir failure. */
+export function pyiTempBroken(text: string): boolean {
+  return /could not create temporary directory|\[PYI-\d+/i.test(text);
+}
+
 // ── Outbound proxy pool ────────────────────────────────────────────────
 // YouTube challenges datacenter IPs (Render free etc.) at the player API:
 // "Failed to extract any player response" no matter which cookie is used.
