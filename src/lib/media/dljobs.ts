@@ -24,7 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cliBaseArgs, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
-import { getNextCookie, markCookieBlocked, markCookieGood, resolvePython } from "./ytdlp";
+import { getNextCookie, ipChallengedRecently, isIpChallenge, markCookieBlocked, markCookieGood, markIpChallenged, resolvePython } from "./ytdlp";
 
 export interface DlJob {
   id: string;
@@ -375,6 +375,9 @@ function friendlyDlError(err: string): string {
   if (/429|too many requests/i.test(err)) {
     return "YouTube is rate-limiting this server (HTTP 429). Please wait about a minute and try again.";
   }
+  if (/failed to extract any player response/i.test(err)) {
+    return "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again.";
+  }
   if (/requested format/i.test(err)) {
     return "The selected quality is no longer available. Please go back, refresh the formats and try again.";
   }
@@ -513,6 +516,9 @@ async function runYtDlpDownloadCli(
     const at = attempts[i];
     const remaining = deadline - Date.now();
     if (remaining < 20_000) break;
+    // Server-IP challenge active (info phase already got refused): more
+    // download attempts only deepen YouTube's flag — stop right away.
+    if (ipChallengedRecently()) break;
     // 429 during the walk: stop — more attempts only extend the throttle
     if (i > 0 && /429|too many requests/i.test(lastErr)) break;
 
@@ -548,6 +554,12 @@ async function runYtDlpDownloadCli(
     }
     lastErr = r.timedOut ? "attempt timed out" : r.stderr.trim() ? cliErrSummary(r.stderr) : `exit ${r.code}`;
     console.log(`[dl-walk ${i}] ${at.label} failed in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s: ${lastErr.slice(0, 120)}`);
+    // All player clients refused with this cookie = server-IP challenge —
+    // cool down globally so the NEXT user request fails fast and gently.
+    if (isIpChallenge(lastErr)) {
+      markIpChallenged();
+      break;
+    }
     // A challenged cookie cools down so later requests start elsewhere
     if (at.ck && /sign in to confirm|not a bot/i.test(lastErr)) markCookieBlocked(at.ck, 120_000);
   }

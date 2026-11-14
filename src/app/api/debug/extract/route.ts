@@ -14,7 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { resolvePython, readExtractDebug } from "@/lib/media/ytdlp";
+import { resolvePython, readExtractDebug, ipChallengedRecently } from "@/lib/media/ytdlp";
 import { cliBaseArgs, useCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
 
 export const dynamic = "force-dynamic";
@@ -125,7 +125,11 @@ export async function GET(req: NextRequest) {
 
   // Vercel has no python3 — run the standalone yt-dlp binary instead of
   // extract.py and return a COMPACT summary (the -J payload is huge).
-  const attempt = useCliEngine()
+  // During an active server-IP challenge, do NOT spawn another attempt —
+  // every debug visit otherwise hammers the player API and extends the flag.
+  const attempt = ipChallengedRecently()
+    ? ({ ok: false, error: "skipped: server-IP challenge cooldown active (waiting it out)" } as Record<string, unknown>)
+    : useCliEngine()
     ? await runCliOne(url, cookiePath, client, 40_000)
     : await runOne({ mode: "info", url, cookiefile: cookiePath, client }, 40_000);
 

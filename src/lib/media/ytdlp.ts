@@ -475,6 +475,32 @@ function rateLimitedRecently(): boolean {
   return (_gRate.__ytRateLimitedUntil || 0) > Date.now();
 }
 
+// ── Server-IP challenge awareness ──────────────────────────────────────
+// "Failed to extract any player response" on a FULL client walk (all 7
+// player clients refused) means YouTube is challenging the SERVER's IP —
+// the same cookies extract fine from a residential IP. Every further
+// attempt hammers the player API ~7× more and extends the flag, so cool
+// down globally (like a 429) and fail fast with a clear message.
+const _gBlock = globalThis as unknown as { __ytIpChallengeUntil?: number };
+const IP_CHALLENGE_COOLDOWN_MS = 300_000; // 5 min — challenges usually decay
+
+export function markIpChallenged(): void {
+  _gBlock.__ytIpChallengeUntil = Date.now() + IP_CHALLENGE_COOLDOWN_MS;
+}
+
+export function ipChallengedRecently(): boolean {
+  return (_gBlock.__ytIpChallengeUntil || 0) > Date.now();
+}
+
+/** Either YouTube-side throttle is active — stop walking immediately. */
+function blockedRecently(): boolean {
+  return rateLimitedRecently() || ipChallengedRecently();
+}
+
+export function isIpChallenge(err: string): boolean {
+  return /failed to extract any player response/i.test(err);
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
 export async function ytSearch(q: string, limit = 12): Promise<{ results: SearchVideo[] }> {
@@ -556,6 +582,11 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       "YouTube is rate-limiting this server (HTTP 429). Please wait about a minute and try again."
     );
   }
+  if (ipChallengedRecently()) {
+    throw new Error(
+      "YouTube is challenging this server's connection right now — please wait about 5 minutes and try again."
+    );
+  }
 
   const budgetStart = Date.now();
   // Never START an attempt that cannot finish: with less than MIN_ATTEMPT_MS
@@ -593,6 +624,12 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       markRateLimited();
       return null;
     }
+    // Server-IP challenge (all player clients refused): stop walking —
+    // the next cookie will hit the same wall and deepen YouTube's flag.
+    if (isIpChallenge(lastError)) {
+      markIpChallenged();
+      return null;
+    }
     if (cookiefile) {
       if (isBotChallenge(lastError)) markCookieBlocked(cookiefile, 600_000); // 10 min
       else if (isBlockError(lastError)) markCookieBlocked(cookiefile, 120_000); // soft 2 min
@@ -608,28 +645,28 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   if (st_lastGood() && inBudget()) {
     const r = await attempt(st_lastGood(), CLIENT_WALK);
     if (r) return r;
-    if (rateLimitedRecently()) throw new Error(lastError);
+    if (blockedRecently()) throw new Error(lastError);
   }
 
   // R2: remaining healthy cookies sequentially (internal client walk)
   const others = healthy().filter((c) => c.file !== st_lastGood());
   for (const c of others) {
-    if (!inBudget() || rateLimitedRecently()) break;
+    if (!inBudget() || blockedRecently()) break;
     const r = await attempt(c.file, CLIENT_WALK);
     if (r) return r;
   }
-  if (rateLimitedRecently()) throw new Error(lastError);
+  if (blockedRecently()) throw new Error(lastError);
 
   // R3: mediaconnect without cookies (best single shot on clean IPs)
-  if (inBudget() && !rateLimitedRecently()) {
+  if (inBudget() && !blockedRecently()) {
     const r = await attempt(null, "mediaconnect");
     if (r) return r;
   }
 
   // R4: player-client walk on the assigned cookie
-  if (assigned && inBudget() && !rateLimitedRecently()) {
+  if (assigned && inBudget() && !blockedRecently()) {
     for (const client of clients) {
-      if (!inBudget() || rateLimitedRecently()) break;
+      if (!inBudget() || blockedRecently()) break;
       const r = await attempt(assigned, client);
       if (r) return r;
     }
@@ -637,11 +674,11 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
 
   // R5: remaining cookies × key clients, budget allowing — even a
   // soft-cooled cookie is better than giving up with an empty pool.
-  if (inBudget() && !rateLimitedRecently()) {
+  if (inBudget() && !blockedRecently()) {
     const pool = loadCookies().filter((c) => c.file !== assigned);
     outer: for (const c of pool) {
       for (const client of ["tv", "web_safari", null]) {
-        if (!inBudget() || rateLimitedRecently()) break outer;
+        if (!inBudget() || blockedRecently()) break outer;
         const r = await attempt(c.file, client);
         if (r) return r;
       }
@@ -649,9 +686,9 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   }
 
   // R6: no-cookie client walk as a last resort
-  if (inBudget() && !rateLimitedRecently()) {
+  if (inBudget() && !blockedRecently()) {
     for (const client of clients) {
-      if (!inBudget() || rateLimitedRecently()) break;
+      if (!inBudget() || blockedRecently()) break;
       const r = await attempt(null, client);
       if (r) return r;
     }
