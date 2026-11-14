@@ -1,7 +1,6 @@
-# PRIMARY: local Cloudflare WARP tunnel (wireproxy spawned by engine.ts at
-# boot). Consumer-grade exit IP — YouTube does not bot-challenge it like
-# Render's datacenter IP. Fallbacks: free public proxies (refresh rebuilds
-# them from public lists, validated from the host's own network).
+# PRIMARY + DEFAULT: local Cloudflare WARP tunnel (wireproxy, spawned by
+# engine.ts at boot — socks5://127.0.0.1:40000). Consumer-grade exit IP.
+# NOTE: no free public proxies in the seed — dead ones burn 60s per attempt.
+# Free proxies enter the pool ONLY through refreshProxyPool(), which
+# validates them from the host's own network first (CONNECT + player API).
 socks5://127.0.0.1:40000
-http://125.26.165.245:8080
-http://45.232.0.2:8080

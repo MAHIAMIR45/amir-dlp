@@ -933,10 +933,14 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
         // (fastskip gets challenge-lite there even though it works from
         // other clean exits). Free proxies stay on the fast recipes.
         if (isLocalProxy(p)) {
-          // Full walk + a 90s cap: watch page + configs through the tunnel
-          // plus Render's slow spawns — verified 49 formats when allowed
-          // to finish (standalone runs succeed 3/3).
-          return attempt(null, "full", p, ON_RENDER ? 90_000 : PROXY_CAP);
+          // Alternate walk shapes between batches: the FULL default walk is
+          // the verified primary (49 formats), and ios/android/tv (all
+          // pre-signed, no signature step) passes when YouTube briefly
+          // challenges the FULL shape on the shared WARP egress.
+          const warpWalk = walkIdx % 2 === 0 ? "full" : "ios,android,tv";
+          // 90s cap: watch page + configs through the tunnel plus Render's
+          // slow spawns — verified 49 formats when allowed to finish.
+          return attempt(null, warpWalk, p, ON_RENDER ? 90_000 : PROXY_CAP);
         }
         return attempt(round.ck, round.walk, p, PROXY_CAP);
       })
