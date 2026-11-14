@@ -547,6 +547,10 @@ async function runYtDlpDownloadCli(
         });
         if (pinnedCk) attempts.push({ ck: null, ca: opts.clientWalk, proxy: rt, label: `no-cookie+${opts.clientWalk.split(",")[0]}…@pinned-proxy` });
       }
+      // fastskip first on every proxy route: pre-signed clients (tv/ios/
+      // android) return full format lists in seconds without the watch
+      // page or configs — the validated fast recipe through clean exits.
+      attempts.push({ ck: null, ca: "fastskip", proxy: rt, label: "no-cookie+fastskip@proxy" });
       attempts.push({ ck: null, ca: DL_CLIENT_WALK, proxy: rt, label: "no-cookie+clients@proxy" });
       if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients@proxy` });
       if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients@proxy` });
@@ -597,9 +601,12 @@ async function runYtDlpDownloadCli(
     const ck = at.ck ? writableCookiePath(at.ck) : null;
     if (ck) argv.push("--cookies", ck);
     // Walk modes: "full" = default (no overrides); "fullskip" = skip the
-    // watch page but keep the player configs (the walk that returns FULL
-    // format lists through clean proxies); anything else = client walk.
-    if (at.ca === "fullskip") {
+    // watch page but keep the player configs; "fastskip" = skip BOTH (the
+    // fastest shape — full lists from clean exits in seconds); anything
+    // else = client walk.
+    if (at.ca === "fastskip") {
+      argv.push("--extractor-args", "youtube:player_skip=webpage,configs");
+    } else if (at.ca === "fullskip") {
       argv.push("--extractor-args", "youtube:player_skip=webpage");
     } else if (at.ca && at.ca !== "full") {
       argv.push("--extractor-args", `youtube:player_client=${at.ca}`);

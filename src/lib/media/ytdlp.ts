@@ -289,18 +289,22 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
     "--no-playlist",
   ];
   // Walk modes:
+  //  · "fastskip" = player_skip=webpage,configs — the FASTEST shape. On a
+  //                 CLEAN exit IP it returns the COMPLETE list (verified:
+  //                 48 formats / 4K in 8s through a validated proxy).
   //  · "full"     = completely default (watch page + configs + default
   //                 client walk). Complete lists but the 1-2MB watch page
   //                 is too slow through ~40KB/s public proxies.
   //  · "fullskip" = player_skip=webpage ONLY (configs still fetched).
-  //                 THE SWEET SPOT: default client order + signature
-  //                 timestamp from the configs returns the FULL format
-  //                 list (verified 48 formats / 4K through a validated
-  //                 proxy) at player-API-only speed.
+  //                 Default client order + signature timestamp from the
+  //                 configs — the validated fallback when fastskip serves
+  //                 a challenge-lite list.
   //  · (default)  = player_skip=webpage,configs + optional client walk —
   //                 fastest, but challenge-lite/degraded on flagged IPs.
   if (client === "full") {
     // no extractor-args at all
+  } else if (client === "fastskip") {
+    argv.push("--extractor-args", "youtube:player_skip=webpage,configs");
   } else if (client === "fullskip") {
     argv.push("--extractor-args", "youtube:player_skip=webpage");
   } else {
@@ -869,8 +873,13 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // the full 47-format list). Cookie batches ride along for age-gated
   // videos, then alternate client walks as fallbacks.
   const PROXY_ROUNDS: { walk: string; ck: string | null }[] = [
+    // fastskip FIRST: probe-validated clean exits return the complete list
+    // in a fraction of the time (no configs/watch-page fetch — verified
+    // 48 formats/4K in 8s). fullskip stays as the signature-timestamp
+    // fallback, then the full default shape, then a key-client walk.
+    { walk: "fastskip", ck: null },
     { walk: "fullskip", ck: null },
-    { walk: "fullskip", ck: proxyCookie },
+    { walk: "fastskip", ck: proxyCookie },
     { walk: "full", ck: null },
     { walk: "ios,android,tv", ck: null },
   ];
@@ -879,6 +888,15 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     // NOTE: rateLimitedRecently() intentionally NOT checked here — a 429 on
     // the server's own IP has nothing to do with the proxies' exit IPs.
     if (!inBudget()) break;
+    // Pool drained mid-walk (every exit cooled down): build ONE fresh
+    // validated pool right now (dedup'd + bounded) instead of breaking
+    // out with routes left unused. Free lists decay within the hour, so
+    // a mid-walk rebuild is often the difference between success and a
+    // dead spinner.
+    if (healthyProxyCount() < 2) {
+      const built = await ensureProxyPoolOnce(70_000);
+      if (!built && !healthyProxyCount()) break; // nothing validated — stop
+    }
     // Pool running low → refresh in the background (throttled 10 min) so a
     // fresh pool is ready before the current one fully dies.
     if (healthyProxyCount() < 4) refreshProxyPoolAsync();
