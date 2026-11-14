@@ -134,6 +134,26 @@ export async function GET(req: NextRequest) {
       url: f.url,
       download_url: mp3Link(url, f, title, dur),
     }));
+    // Proxy routes (tv client) often return COMBINED formats only, so the
+    // MP3 tab would be empty even though the download engine can still
+    // resolve bestaudio itself — synthesize one row for it.
+    if (!aoRows.length && ((info.video_only || []).length || (info.combined || []).length)) {
+      aoRows.push({
+        format_id: "bestaudio",
+        ext: "mp3",
+        height: null,
+        fps: null,
+        vcodec: "none",
+        acodec: "mp4a",
+        abr: 128,
+        filesize: null,
+        filesize_human: null,
+        format_note: "Best audio",
+        has_audio: true,
+        url: null,
+        download_url: mp3Link(url, { format_id: "bestaudio" } as FormatEntry, title, dur),
+      });
+    }
 
     trackRequest({ headers: req.headers, path: "/api/download/video", method: "GET", url, platform: "youtube", status: 200 });
     return new Response(

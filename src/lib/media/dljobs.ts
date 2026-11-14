@@ -544,7 +544,10 @@ async function runYtDlpDownloadCli(
       ...cliBaseArgs(),
       "--newline",
       "--concurrent-fragments",
-      "4",
+      // 2, not 4: on the 512MB Render free instance every parallel fragment
+      // holds buffers, and downloads through slow free proxies just stall
+      // with 4 anyway — 2 is gentler on memory and no slower there.
+      "2",
       "--socket-timeout",
       "25",
       "--retries",
