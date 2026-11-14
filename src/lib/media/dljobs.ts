@@ -23,8 +23,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cliBaseArgs, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
-import { getNextCookie, ipChallengedRecently, isIpChallenge, markCookieBlocked, markCookieGood, markIpChallenged, resolvePython } from "./ytdlp";
+import { cliBaseArgs, getNextProxy, markProxyDead, markProxyGood, resolveFfmpegBin, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
+import { directBlockedRecently, getNextCookie, ipChallengedRecently, isIpChallenge, markCookieBlocked, markCookieGood, markDirectBlocked, resolvePython } from "./ytdlp";
 
 export interface DlJob {
   id: string;
@@ -504,21 +504,37 @@ async function runYtDlpDownloadCli(
 
   const ck1 = firstCookie || getNextCookie();
   const ck2 = getNextCookie();
-  const attempts: { ck: string | null; ca: string | null; label: string }[] = [];
-  if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, label: `${path.basename(ck1)}+clients` });
-  if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, label: `${path.basename(ck2)}+clients` });
-  if (ck1) attempts.push({ ck: ck1, ca: null, label: `${path.basename(ck1)}+default` });
-  attempts.push({ ck: null, ca: "tv,web_safari,android", label: "no-cookie+clients" });
-  attempts.push({ ck: null, ca: "mediaconnect", label: "no-cookie+mediaconnect" });
+  // Routes: the server's own IP first (unless it is known-challenged),
+  // then the proxy pool. Cookies ride along on every route.
+  const routes: (string | null)[] = directBlockedRecently() ? [] : [null];
+  for (;;) {
+    const p = getNextProxy();
+    if (!p) break;
+    if (!routes.includes(p)) routes.push(p);
+    if (routes.length >= 8) break; // cap per download job
+  }
+  const attempts: { ck: string | null; ca: string | null; proxy: string | null; label: string }[] = [];
+  for (const rt of routes) {
+    const tag = rt ? "@proxy" : "";
+    if (ck1) attempts.push({ ck: ck1, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck1)}+clients${tag}` });
+    if (ck2 && ck2 !== ck1) attempts.push({ ck: ck2, ca: DL_CLIENT_WALK, proxy: rt, label: `${path.basename(ck2)}+clients${tag}` });
+  }
+  // No-cookie fallbacks stay direct-only (mediaconnect works on clean IPs)
+  if (!directBlockedRecently()) {
+    attempts.push({ ck: null, ca: "tv,web_safari,android", proxy: null, label: "no-cookie+clients" });
+    attempts.push({ ck: null, ca: "mediaconnect", proxy: null, label: "no-cookie+mediaconnect" });
+  }
 
   let lastErr = "";
   for (let i = 0; i < attempts.length; i++) {
     const at = attempts[i];
     const remaining = deadline - Date.now();
     if (remaining < 20_000) break;
-    // Server-IP challenge active (info phase already got refused): more
-    // download attempts only deepen YouTube's flag — stop right away.
+    // Global challenge active (everything already failed recently): stop.
     if (ipChallengedRecently()) break;
+    // Direct IP flagged mid-walk (a direct attempt just got refused):
+    // skip the remaining DIRECT attempts — proxy routes still continue.
+    if (!at.proxy && directBlockedRecently()) continue;
     // 429 during the walk: stop — more attempts only extend the throttle
     if (i > 0 && /429|too many requests/i.test(lastErr)) break;
 
@@ -540,6 +556,7 @@ async function runYtDlpDownloadCli(
     const ck = at.ck ? writableCookiePath(at.ck) : null;
     if (ck) argv.push("--cookies", ck);
     if (at.ca) argv.push("--extractor-args", `youtube:player_client=${at.ca}`);
+    if (at.proxy) argv.push("--proxy", at.proxy);
     argv.push("-f", format, "-o", `${myBase}.%(ext)s`, opts.url);
 
     const t0 = Date.now();
@@ -549,16 +566,24 @@ async function runYtDlpDownloadCli(
     const done = pickFinalFile(myBase);
     if (done) {
       if (at.ck) markCookieGood(at.ck);
+      if (at.proxy) markProxyGood(at.proxy);
       console.log(`[dl-walk ${i}] ${at.label} OK in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s (${done.size} bytes)`);
       return done;
     }
     lastErr = r.timedOut ? "attempt timed out" : r.stderr.trim() ? cliErrSummary(r.stderr) : `exit ${r.code}`;
     console.log(`[dl-walk ${i}] ${at.label} failed in ${Math.round(((Date.now() - t0) / 1000) * 10) / 10}s: ${lastErr.slice(0, 120)}`);
-    // All player clients refused with this cookie = server-IP challenge —
-    // cool down globally so the NEXT user request fails fast and gently.
+    // All player clients refused:
+    //  · via proxy → this proxy's IP is flagged too — cool it down, try
+    //    the next route (downloads just keep walking the pool).
+    //  · direct → remember the server IP is flagged; remaining DIRECT
+    //    attempts are skipped, proxy routes continue.
     if (isIpChallenge(lastErr)) {
-      markIpChallenged();
-      break;
+      if (at.proxy) {
+        markProxyDead(at.proxy, 600_000); // 10 min
+      } else {
+        markDirectBlocked();
+      }
+      continue;
     }
     // A challenged cookie cools down so later requests start elsewhere
     if (at.ck && /sign in to confirm|not a bot/i.test(lastErr)) markCookieBlocked(at.ck, 120_000);

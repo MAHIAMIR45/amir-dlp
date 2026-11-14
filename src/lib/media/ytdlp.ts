@@ -4,7 +4,16 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { cliBaseArgs, useCliEngine, writableCookiePath, ytDlpCliPath } from "./engine";
+import {
+  cliBaseArgs,
+  getNextProxy,
+  healthyProxyCount,
+  markProxyDead,
+  markProxyGood,
+  useCliEngine,
+  writableCookiePath,
+  ytDlpCliPath,
+} from "./engine";
 
 export interface SearchVideo {
   id: string;
@@ -265,6 +274,7 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
   const url = String(args.url || "");
   const cookiefile = (args.cookiefile as string | null) || null;
   const client = (args.client as string | null) || null;
+  const proxy = (args.proxy as string | null) || null;
   const argv = [
     ytDlpCliPath(),
     ...cliBaseArgs(),
@@ -282,6 +292,7 @@ async function runCliInfo(args: Record<string, unknown>, timeoutMs: number): Pro
   const ck = writableCookiePath(cookiefile);
   if (ck) argv.push("--cookies", ck);
   if (client) argv.push("--extractor-args", `youtube:player_client=${client}`);
+  if (proxy) argv.push("--proxy", proxy);
   argv.push(url);
   const r = await spawnCli(argv, timeoutMs);
   if (r.timedOut) {
@@ -478,11 +489,17 @@ function rateLimitedRecently(): boolean {
 // ── Server-IP challenge awareness ──────────────────────────────────────
 // "Failed to extract any player response" on a FULL client walk (all 7
 // player clients refused) means YouTube is challenging the SERVER's IP —
-// the same cookies extract fine from a residential IP. Every further
-// attempt hammers the player API ~7× more and extends the flag, so cool
-// down globally (like a 429) and fail fast with a clear message.
-const _gBlock = globalThis as unknown as { __ytIpChallengeUntil?: number };
+// the same cookies extract fine from a residential IP. Two levels:
+//   directBlocked — the server's OWN IP is challenged (10 min): skip
+//     direct attempts and route the walk through the proxy pool instead.
+//   ipChallenged  — EVERYTHING failed (direct AND every healthy proxy):
+//     global 5-min fail-fast so retries don't fight a losing battle.
+const _gBlock = globalThis as unknown as {
+  __ytIpChallengeUntil?: number;
+  __ytDirectBlockedUntil?: number;
+};
 const IP_CHALLENGE_COOLDOWN_MS = 300_000; // 5 min — challenges usually decay
+const DIRECT_BLOCKED_MS = 600_000; // 10 min — remember the direct IP is flagged
 
 export function markIpChallenged(): void {
   _gBlock.__ytIpChallengeUntil = Date.now() + IP_CHALLENGE_COOLDOWN_MS;
@@ -490,6 +507,14 @@ export function markIpChallenged(): void {
 
 export function ipChallengedRecently(): boolean {
   return (_gBlock.__ytIpChallengeUntil || 0) > Date.now();
+}
+
+export function markDirectBlocked(): void {
+  _gBlock.__ytDirectBlockedUntil = Date.now() + DIRECT_BLOCKED_MS;
+}
+
+export function directBlockedRecently(): boolean {
+  return (_gBlock.__ytDirectBlockedUntil || 0) > Date.now();
 }
 
 /** Either YouTube-side throttle is active — stop walking immediately. */
@@ -602,16 +627,17 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
   // (FC runtime has no readable stdout logs).
   const tried: { src: string; ok: boolean; err: string; secs: number; js?: Record<string, boolean> }[] = [];
 
-  const attempt = async (cookiefile: string | null, client: string | null): Promise<YtInfo | null> => {
+  const attempt = async (cookiefile: string | null, client: string | null, proxy: string | null = null): Promise<YtInfo | null> => {
     const t0 = Date.now();
     const t = client === "mediaconnect" ? Math.min(MEDIACONNECT_TIMEOUT, remaining()) : Math.min(EXTRACT_TIMEOUT, remaining());
-    const out = (await runPython({ mode: "info", url, cookiefile, client }, t)) as unknown as YtInfo & { took?: number; js?: Record<string, boolean> };
+    const out = (await runPython({ mode: "info", url, cookiefile, client, proxy }, t)) as unknown as YtInfo & { took?: number; js?: Record<string, boolean> };
     const secs = Math.round(((Date.now() - t0) / 1000) * 10) / 10;
-    const src = cookiefile ? cookiefile.split("/").pop() || cookiefile : `client=${client || "default"}`;
+    const src = `${cookiefile ? cookiefile.split("/").pop() || cookiefile : `client=${client || "default"}`}${proxy ? "@proxy" : ""}`;
     if (out.ok) {
       tried.push({ src, ok: true, err: "", secs, js: out.js });
       writeExtractDebug(url, tried);
       if (cookiefile) markCookieGood(cookiefile);
+      if (proxy) markProxyGood(proxy);
       return out;
     }
     lastError = out.error || lastError;
@@ -624,10 +650,18 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
       markRateLimited();
       return null;
     }
-    // Server-IP challenge (all player clients refused): stop walking —
-    // the next cookie will hit the same wall and deepen YouTube's flag.
+    // Server-IP challenge (all player clients refused):
+    //  · through a proxy → THIS proxy's IP is also flagged — cool it down
+    //    and let the walk try the next proxy (do not stop the world).
+    //  · direct → remember the server IP is flagged; set the global
+    //    fail-fast ONLY when there are no proxies left to try.
     if (isIpChallenge(lastError)) {
-      markIpChallenged();
+      if (proxy) {
+        markProxyDead(proxy, 600_000); // 10 min
+      } else {
+        markDirectBlocked();
+        if (!healthyProxyCount()) markIpChallenged();
+      }
       return null;
     }
     if (cookiefile) {
@@ -652,30 +686,54 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     throw new Error(lastError);
   };
 
-  // R1: last-known-good cookie + internal client walk — warm path
-  if (st_lastGood() && inBudget()) {
+  // R1: last-known-good cookie + internal client walk — warm path.
+  // Skipped while the server's own IP is known to be challenged (R3
+  // proxies take over until the flag decays).
+  if (!directBlockedRecently() && st_lastGood() && inBudget()) {
     const r = await attempt(st_lastGood(), CLIENT_WALK);
     if (r) return r;
     if (blockedRecently()) throwBlocked();
   }
 
   // R2: remaining healthy cookies sequentially (internal client walk)
-  const others = healthy().filter((c) => c.file !== st_lastGood());
-  for (const c of others) {
-    if (!inBudget() || blockedRecently()) break;
-    const r = await attempt(c.file, CLIENT_WALK);
-    if (r) return r;
+  if (!directBlockedRecently()) {
+    const others = healthy().filter((c) => c.file !== st_lastGood());
+    for (const c of others) {
+      if (!inBudget() || blockedRecently() || directBlockedRecently()) break;
+      const r = await attempt(c.file, CLIENT_WALK);
+      if (r) return r;
+    }
   }
   if (blockedRecently()) throwBlocked();
 
-  // R3: mediaconnect without cookies (best single shot on clean IPs)
-  if (inBudget() && !blockedRecently()) {
+  // R3: PROXY rounds — the server IP is flagged (direct rounds refused or
+  // skipped): route the SAME cookie + client walk through each healthy
+  // proxy until one extracts. A proxy that fails is cooled down and the
+  // next one is tried; when the pool is exhausted the global fail-fast
+  // kicks in so users get an instant friendly message instead of minutes
+  // of futile spinning.
+  const proxyCookie = st_lastGood() || assigned;
+  for (;;) {
+    if (!inBudget() || rateLimitedRecently()) break;
+    const proxy = getNextProxy();
+    if (!proxy) break;
+    const r = await attempt(proxyCookie, CLIENT_WALK, proxy);
+    if (r) return r;
+    if (rateLimitedRecently()) throwBlocked();
+    if (!healthyProxyCount()) {
+      markIpChallenged();
+      throwBlocked();
+    }
+  }
+
+  // R4: mediaconnect without cookies (best single shot on clean IPs)
+  if (!directBlockedRecently() && inBudget() && !blockedRecently()) {
     const r = await attempt(null, "mediaconnect");
     if (r) return r;
   }
 
-  // R4: player-client walk on the assigned cookie
-  if (assigned && inBudget() && !blockedRecently()) {
+  // R5: player-client walk on the assigned cookie
+  if (assigned && !directBlockedRecently() && inBudget() && !blockedRecently()) {
     for (const client of clients) {
       if (!inBudget() || blockedRecently()) break;
       const r = await attempt(assigned, client);
@@ -683,9 +741,9 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     }
   }
 
-  // R5: remaining cookies × key clients, budget allowing — even a
+  // R6: remaining cookies × key clients, budget allowing — even a
   // soft-cooled cookie is better than giving up with an empty pool.
-  if (inBudget() && !blockedRecently()) {
+  if (!directBlockedRecently() && inBudget() && !blockedRecently()) {
     const pool = loadCookies().filter((c) => c.file !== assigned);
     outer: for (const c of pool) {
       for (const client of ["tv", "web_safari", null]) {
@@ -696,8 +754,8 @@ export async function ytInfoWithFallback(url: string): Promise<YtInfo> {
     }
   }
 
-  // R6: no-cookie client walk as a last resort
-  if (inBudget() && !blockedRecently()) {
+  // R7: no-cookie client walk as a last resort
+  if (!directBlockedRecently() && inBudget() && !blockedRecently()) {
     for (const client of clients) {
       if (!inBudget() || blockedRecently()) break;
       const r = await attempt(null, client);

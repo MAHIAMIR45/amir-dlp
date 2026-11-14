@@ -15,7 +15,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { resolvePython, readExtractDebug, ipChallengedRecently } from "@/lib/media/ytdlp";
-import { cliBaseArgs, useCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
+import { cliBaseArgs, proxyPoolStatus, useCliEngine, writableCookiePath, ytDlpCliPath } from "@/lib/media/engine";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -121,6 +121,7 @@ export async function GET(req: NextRequest) {
       }
     })(),
     node_version: process.version,
+    proxy_pool: proxyPoolStatus(),
   };
 
   // Vercel has no python3 — run the standalone yt-dlp binary instead of

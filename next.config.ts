@@ -16,6 +16,7 @@ const nextConfig: NextConfig = {
     "/api/**": [
       "./python/cookies/**",
       "./python/*.py",
+      "./python/proxies.txt",
       "./bin/**",
       "./node_modules/ffmpeg-static/**",
     ],

@@ -112,3 +112,154 @@ export function writableCookiePath(cookiefile: string | null | undefined): strin
     return cookiefile;
   }
 }
+
+// ── Outbound proxy pool ────────────────────────────────────────────────
+// YouTube challenges datacenter IPs (Render free etc.) at the player API:
+// "Failed to extract any player response" no matter which cookie is used.
+// Routing the SAME yt-dlp + cookies extraction through a proxy gives it a
+// different outbound IP. Sources (merged, deduped):
+//   1. YTDL_PROXIES env  — comma/newline separated, user-provided (best:
+//      paid residential/ISP proxies are stable; free public ones rotate)
+//   2. python/proxies.txt — one host:port per line, "#" comments allowed
+//      (bootstrap pool; can be refreshed at runtime via /api/admin/proxies)
+// Rotation mirrors the cookie pool: last-good first, failures cool down so
+// dead proxies are skipped fast. All traffic stays HTTPS (CONNECT tunnel)
+// — the proxy sees only the domain, never cookie contents.
+export interface ProxySlot {
+  url: string;
+  deadUntil: number;
+}
+
+interface ProxyState {
+  slots: ProxySlot[] | null;
+  idx: number;
+  lastGood: string | null;
+  mtimeKey: string;
+}
+
+const _gp = globalThis as unknown as { __mediaProxyState?: ProxyState };
+
+function proxyState(): ProxyState {
+  if (!_gp.__mediaProxyState) _gp.__mediaProxyState = { slots: null, idx: 0, lastGood: null, mtimeKey: "" };
+  return _gp.__mediaProxyState;
+}
+
+/** Writable runtime pool file — admin refresh writes here first. */
+export function runtimeProxyPoolPath(): string {
+  return path.join(os.tmpdir(), "ytdl_proxy_pool.txt");
+}
+
+function parseProxyLines(text: string): string[] {
+  return text
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter((s) => s && !s.startsWith("#"));
+}
+
+function loadProxies(): ProxySlot[] {
+  const st = proxyState();
+  const seedFile = path.join(process.cwd(), "python", "proxies.txt");
+  const runtimeFile = runtimeProxyPoolPath();
+  let key = "";
+  try {
+    key = `${fs.statSync(seedFile).mtimeMs || 0}|${fs.statSync(runtimeFile).mtimeMs || 0}`;
+  } catch {
+    /* missing files → mtime 0 */
+  }
+  if (st.slots && st.mtimeKey === key) return st.slots;
+
+  const urls: string[] = [];
+  const env = (process.env.YTDL_PROXIES || "").trim();
+  if (env) urls.push(...parseProxyLines(env));
+  try {
+    urls.push(...parseProxyLines(fs.readFileSync(seedFile, "utf-8")));
+  } catch {
+    /* no seed file */
+  }
+  // Runtime-maintained pool (admin refresh) takes precedence: read it LAST
+  // and if non-empty, use it INSTEAD of the seed (it is fresher).
+  let runtime: string[] = [];
+  try {
+    runtime = parseProxyLines(fs.readFileSync(runtimeFile, "utf-8"));
+  } catch {
+    /* no runtime pool yet */
+  }
+  const final = runtime.length ? runtime : urls;
+  st.mtimeKey = key;
+  st.slots = [...new Set(final)].map((url) => ({ url, deadUntil: 0 }));
+  st.idx = 0;
+  if (st.lastGood && !st.slots.some((s) => s.url === st.lastGood)) st.lastGood = null;
+  return st.slots;
+}
+
+function healthySlots(): ProxySlot[] {
+  const now = Date.now();
+  return loadProxies().filter((s) => s.deadUntil < now);
+}
+
+/** Next proxy to try — last-good first, then round-robin over healthy. */
+export function getNextProxy(): string | null {
+  const slots = loadProxies();
+  const st = proxyState();
+  if (st.lastGood) {
+    const g = slots.find((s) => s.url === st.lastGood);
+    if (g && g.deadUntil < Date.now()) return g.url;
+    st.lastGood = null;
+  }
+  const h = healthySlots();
+  if (!h.length) return null;
+  const slot = h[st.idx % h.length];
+  st.idx = (st.idx + 1) % Math.max(1, h.length);
+  return slot.url;
+}
+
+export function markProxyGood(url: string): void {
+  const st = proxyState();
+  st.lastGood = url;
+  const slot = loadProxies().find((s) => s.url === url);
+  if (slot) slot.deadUntil = 0;
+}
+
+export function markProxyDead(url: string, ms: number): void {
+  const st = proxyState();
+  if (st.lastGood === url) st.lastGood = null;
+  const slot = loadProxies().find((s) => s.url === url);
+  if (slot) slot.deadUntil = Date.now() + ms;
+}
+
+export function healthyProxyCount(): number {
+  return healthySlots().length;
+}
+
+/** Debug/admin snapshot — never exposes more than host:port of public pool. */
+export function proxyPoolStatus(): {
+  total: number;
+  healthy: number;
+  lastGood: string | null;
+  sources: string[];
+  proxies: string[];
+} {
+  const slots = loadProxies();
+  const now = Date.now();
+  const sources: string[] = [];
+  if ((process.env.YTDL_PROXIES || "").trim()) sources.push("env:YTDL_PROXIES");
+  try {
+    fs.accessSync(path.join(process.cwd(), "python", "proxies.txt"));
+    sources.push("python/proxies.txt");
+  } catch {
+    /* absent */
+  }
+  try {
+    fs.accessSync(runtimeProxyPoolPath());
+    sources.push("runtime pool");
+  } catch {
+    /* absent */
+  }
+  return {
+    total: slots.length,
+    healthy: slots.filter((s) => s.deadUntil < now).length,
+    lastGood: proxyState().lastGood,
+    sources,
+    proxies: slots.map((s) => `${s.url}${s.deadUntil >= now ? " (cooling)" : ""}`),
+  };
+}
